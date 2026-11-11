@@ -1,0 +1,4 @@
+module PhononCore {
+    header "ptts.h"
+    export *
+}

@@ -1,0 +1,48 @@
+name: relay_reader
+description: "A local book and PDF reader with on-device narration."
+publish_to: none
+version: 1.5.0+7
+
+environment:
+  sdk: ^3.13.0
+
+dependencies:
+  flutter:
+    sdk: flutter
+  archive: ^4.6.0
+  effect_core: ^0.0.3
+  epub_rtl: ^0.1.0
+  file_selector: ^1.1.0
+  just_audio: ^0.10.6
+  path_provider: ^2.1.6
+  pdfrx: ^2.12.0
+  shared_preferences: ^2.5.6
+  sherpa_onnx: ^2.0.1
+  just_audio_background: ^0.0.1-beta.17
+  audio_session: ^0.2.4
+  flutter_edge_ai: ^2.6.0
+  flutter_edge_ai_llama: ^0.1.0
+  llamadart: 0.19.3
+  llamadart_llama_cpp_flutter: 0.19.3
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^6.0.0
+  shared_preferences_platform_interface: ^2.4.2
+  integration_test:
+    sdk: flutter
+
+flutter:
+  uses-material-design: true
+  assets:
+    - assets/kokoro-v1/
+
+hooks:
+  user_defines:
+    llamadart:
+      llamadart_native_runtimes: [llama_cpp]
+
+dependency_overrides:
+  llamadart: 0.19.3
+  llamadart_llama_cpp_flutter: 0.19.3
