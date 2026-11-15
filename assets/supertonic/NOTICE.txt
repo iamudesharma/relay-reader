@@ -1,0 +1,10 @@
+Supertonic 3: Supertone, https://huggingface.co/Supertone/supertonic-3
+Weights: BigScience Open RAIL-M, including its use restrictions. See MODEL-LICENSE.txt.
+Core ML conversion: FluidInference, https://huggingface.co/FluidInference/supertonic-3-coreml
+Revision: 2b5b939dfa1bca362c5212dcafeb8aadde90b1bc
+Relay Reader uses the v2 text/duration models and INT4 ANE vector-estimator buckets.
+
+Swift inference code: FluidInference/FluidAudio (Apache 2.0), revision
+d653a34a620c013febd7530427b4963ae18064b2. See APACHE-2.0.txt.
+Adapted to load only verified local assets, reject text truncation, and check
+cancellation between predictions. No other FluidAudio subsystems are included.

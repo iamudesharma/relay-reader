@@ -1,6 +1,5 @@
 import 'dart:async';
 import 'dart:io';
-import 'dart:isolate';
 
 import 'package:audio_session/audio_session.dart';
 import 'package:flutter/foundation.dart';
@@ -8,10 +7,14 @@ import 'package:flutter/services.dart';
 import 'package:just_audio/just_audio.dart';
 import 'package:just_audio_background/just_audio_background.dart';
 import 'package:path_provider/path_provider.dart';
-import 'package:sherpa_onnx/sherpa_onnx.dart' as sherpa;
 
 import 'lfm3_audio.dart';
+import 'audio_clip_cache.dart';
+import 'listening_sleep_timer.dart';
+import 'mediapipe_tts.dart';
 import 'phonon.dart';
+import 'pocket_tts.dart';
+import 'supertonic.dart';
 
 // English speakers in the bundled Kokoro v1.0 voice table.
 const defaultVoice = 3;
@@ -75,11 +78,16 @@ enum Punctuation { natural, announce }
 enum VoiceEngine {
   kokoro('Kokoro', 'Bundled, works offline'),
   system('System', 'Uses your iPhone voices'),
-  phonon('Phonon', 'Experimental · on-device English');
+  phonon('Phonon', 'Experimental · on-device English'),
+  pocket('Pocket TTS', 'Experimental · on-device English'),
+  supertonic('Supertonic 3', 'Default narrator · on-device · 31 languages');
 
   const VoiceEngine(this.label, this.description);
   final String label;
   final String description;
+
+  static VoiceEngine get platformDefault =>
+      SupertonicModel.supported ? VoiceEngine.supertonic : VoiceEngine.kokoro;
 }
 
 enum SpeechKind { narration, dialogue }
@@ -239,12 +247,18 @@ class VoiceSettings {
     this.lfm3Narration = false,
     this.lfm3Voice = 'female',
     this.phononVoice = 'Harper',
+    this.pocketVoice = PocketTts.defaultVoice,
+    this.supertonicVoice = 'M1',
+    this.supertonicLanguage = 'en',
   });
 
   final VoiceEngine engine;
   final int voice;
   final String? systemVoice;
   final String phononVoice;
+  final String pocketVoice;
+  final String supertonicVoice;
+  final String supertonicLanguage;
   final double speed;
   final double pauses;
   final double pitch;
@@ -252,7 +266,7 @@ class VoiceSettings {
   final Punctuation punctuation;
   final bool characterVoices;
 
-  /// Uses fewer CPU threads and generates less audio ahead. Intended for
+  /// Generates less audio ahead and releases idle voices sooner. Intended for
   /// longer listening sessions on battery.
   final bool batterySaver;
 
@@ -275,6 +289,9 @@ class VoiceSettings {
     bool? lfm3Narration,
     String? lfm3Voice,
     String? phononVoice,
+    String? pocketVoice,
+    String? supertonicVoice,
+    String? supertonicLanguage,
   }) => VoiceSettings(
     engine: engine ?? this.engine,
     voice: voice ?? this.voice,
@@ -289,6 +306,9 @@ class VoiceSettings {
     lfm3Narration: lfm3Narration ?? this.lfm3Narration,
     lfm3Voice: lfm3Voice ?? this.lfm3Voice,
     phononVoice: phononVoice ?? this.phononVoice,
+    pocketVoice: pocketVoice ?? this.pocketVoice,
+    supertonicVoice: supertonicVoice ?? this.supertonicVoice,
+    supertonicLanguage: supertonicLanguage ?? this.supertonicLanguage,
   );
 }
 
@@ -300,6 +320,40 @@ const voicePresets = {
   'British': VoiceSettings(voice: 26, speed: .98, pauses: 1),
   'Fast': VoiceSettings(speed: 1.22, pauses: .55),
 };
+
+/// Kokoro's presets choose voice timbre as well as pacing. Other narrators
+/// retain their own voice and expose only supported playback-rate presets.
+bool usesKokoroVoicePresets(VoiceSettings settings) =>
+    settings.engine == VoiceEngine.kokoro && !settings.lfm3Narration;
+
+Map<String, VoiceSettings> narrationPresets(VoiceSettings settings) =>
+    usesKokoroVoicePresets(settings)
+    ? voicePresets
+    : {
+        'Relaxed': settings.withChanges(speed: .85),
+        'Natural': settings.withChanges(speed: 1),
+        'Fast': settings.withChanges(speed: 1.22),
+      };
+
+VoiceSettings applyNarrationPreset(
+  VoiceSettings settings,
+  VoiceSettings preset,
+) => usesKokoroVoicePresets(settings)
+    ? settings.withChanges(
+        voice: preset.voice,
+        speed: preset.speed,
+        pauses: preset.pauses,
+        punctuation: preset.punctuation,
+      )
+    : settings.withChanges(speed: preset.speed);
+
+bool isNarrationPresetSelected(VoiceSettings settings, VoiceSettings preset) {
+  if ((settings.speed - preset.speed).abs() > .000001) return false;
+  return !usesKokoroVoicePresets(settings) ||
+      (settings.voice == preset.voice &&
+          (settings.pauses - preset.pauses).abs() < .000001 &&
+          settings.punctuation == preset.punctuation);
+}
 
 const _marks = {
   ',': 'comma',
@@ -334,41 +388,44 @@ String prepareSpeech(String text, Punctuation punctuation) {
 /// sees more context, while the hard cap keeps preview latency bounded.
 const speechChunkLimit = 420;
 
+/// Sentence boundaries preserve abbreviations, decimals and closing quotes.
 Iterable<String> speechChunks(String text) sync* {
-  // Paragraph boundaries are the most natural place to join two audio clips.
   for (final paragraph
       in text.replaceAll('\r\n', '\n').split(RegExp(r'\n\s*\n'))) {
     final normalized = paragraph.replaceAll(RegExp(r'\s+'), ' ').trim();
-    if (normalized.isEmpty) continue;
-    final runes = normalized.runes.toList();
-    for (var start = 0; start < runes.length;) {
-      var end = (start + speechChunkLimit).clamp(0, runes.length);
-      if (end < runes.length) {
-        var lastSpace = -1;
-        var lastClause = -1;
-        var lastSentence = -1;
-        for (var i = start + speechChunkLimit ~/ 2; i < end; i++) {
-          if (runes[i] != 32) continue;
-          lastSpace = i;
-          final previous = runes[i - 1];
-          if ('.!?…'.codeUnits.contains(previous)) {
-            lastSentence = i;
-          } else if (',;:—–'.codeUnits.contains(previous)) {
-            lastClause = i;
-          }
-        }
-        if (lastSentence > start) {
-          end = lastSentence + 1;
-        } else if (lastClause > start) {
-          end = lastClause + 1;
-        } else if (lastSpace > start) {
-          end = lastSpace;
+    var start = 0;
+    final boundaries = RegExp(r'[.!?…]+["”’\x27)]*(?:\s+|$)')
+        .allMatches(normalized);
+    for (final boundary in boundaries) {
+      final prefix = normalized.substring(start, boundary.end).trim();
+      if (RegExp(
+        r'(?:\b(?:Mr|Mrs|Ms|Dr|Prof|Sr|Jr|St|vs|etc)|\b[A-Z]|e\.g|i\.e)\.$',
+        caseSensitive: false,
+      ).hasMatch(prefix)) {
+        continue;
+      }
+      yield* _boundedSpeech(prefix);
+      start = boundary.end;
+    }
+    yield* _boundedSpeech(normalized.substring(start).trim());
+  }
+}
+
+Iterable<String> _boundedSpeech(String text) sync* {
+  final runes = text.runes.toList();
+  for (var start = 0; start < runes.length;) {
+    var end = (start + speechChunkLimit).clamp(0, runes.length);
+    if (end < runes.length) {
+      for (var i = end - 1; i > start + speechChunkLimit ~/ 2; i--) {
+        if (runes[i] == 32) {
+          end = i + 1;
+          break;
         }
       }
-      final part = String.fromCharCodes(runes, start, end).trim();
-      if (part.isNotEmpty) yield part;
-      start = end;
     }
+    final part = String.fromCharCodes(runes, start, end).trim();
+    if (part.isNotEmpty) yield part;
+    start = end;
   }
 }
 
@@ -379,15 +436,82 @@ class SpeechFailure implements Exception {
 
 enum SpeechState { idle, preparing, playing, paused }
 
+class _NarrationSession {
+  const _NarrationSession({
+    required this.title,
+    required this.sectionName,
+    required this.length,
+    required this.loadSpeech,
+    required this.showSection,
+    required this.continueToEnd,
+    required this.settings,
+    this.bookId,
+    this.onProgress,
+  });
+  final String title, sectionName;
+  final String? bookId;
+  final int length;
+  final SpeechLoader loadSpeech;
+  final ValueChanged<int> showSection;
+  final bool continueToEnd;
+  final VoiceSettings settings;
+  final NarrationProgress? onProgress;
+}
+
+typedef ClipSynthesizer = Future<void> Function(
+  SpeechUtterance speech,
+  VoiceSettings settings,
+  String path,
+);
+
 class Narrator extends ChangeNotifier {
-  Narrator({this.prefetch = 4});
+  Narrator({
+    this.prefetch = 4,
+    AudioPlayer? player,
+    AudioPlayer? previewPlayer,
+    AudioClipCache? cache,
+    this.synthesizeClip,
+    this.prepareClipEngine,
+    this.configureAudioSession,
+  }) : _player = player ?? AudioPlayer(),
+       _previewPlayer = previewPlayer ?? AudioPlayer(),
+       _cache = cache ?? AudioClipCache.shared {
+    sleepTimer = ListeningSleepTimer(() => unawaited(stop()));
+  }
 
   /// How many generated clips stay queued ahead of playback.
   final int prefetch;
 
-  final _player = AudioPlayer();
-  final _previewPlayer = AudioPlayer();
+  final AudioPlayer _player;
+  final AudioPlayer _previewPlayer;
+  final AudioClipCache _cache;
+  final ClipSynthesizer? synthesizeClip;
+  final Future<void> Function()? prepareClipEngine;
+  final Future<void> Function()? configureAudioSession;
+  late final ListeningSleepTimer sleepTimer;
+  _NarrationSession? _session;
+  int? currentSection, currentUtterance;
+  int _currentSectionLength = 0;
+  bool navigating = false;
+  Timer? _settingsTimer;
+  Future<void>? _preparation;
+  int _startIndex = 0, _startUtterance = 0;
+  String? _startPassage;
+  bool _continueToEnd = true;
+  int _navigationToken = 0;
+  bool get canPreviousSentence =>
+      active &&
+      !navigating &&
+      currentUtterance != null &&
+      (currentUtterance! > 0 || currentSection! > 0);
+  bool get canNextSentence =>
+      active &&
+      !navigating &&
+      currentUtterance != null &&
+      (currentUtterance! + 1 < _currentSectionLength ||
+          (_session!.continueToEnd && currentSection! + 1 < _session!.length));
   Future<void>? _run;
+  Future<void>? _closing;
   Completer<void>? _changed;
   Object? _playError;
   bool _stopped = false;
@@ -407,6 +531,7 @@ class Narrator extends ChangeNotifier {
 
   void start({
     required String title,
+    String? bookId,
     required String sectionName,
     required int index,
     required int length,
@@ -417,27 +542,233 @@ class Narrator extends ChangeNotifier {
     String? resumePassage,
     NarrationProgress? onProgress,
   }) {
-    if (_closed || active) return;
+    if (_closed || active || navigating) return;
+    final session = _NarrationSession(
+      title: title,
+      bookId: bookId,
+      sectionName: sectionName,
+      length: length,
+      loadSpeech: loadSpeech,
+      showSection: showSection,
+      continueToEnd: continueToEnd,
+      onProgress: onProgress,
+      settings: settings,
+    );
+    _startSession(session, index, startUtterance, resumePassage: resumePassage);
+  }
+
+  void _startSession(
+    _NarrationSession session,
+    int index,
+    int utterance, {
+    String? resumePassage,
+    bool paused = false,
+  }) {
+    if (_closed) return;
+    _session = session;
+    _startIndex = index;
+    _startUtterance = utterance;
+    _startPassage = resumePassage;
+    _continueToEnd = session.continueToEnd;
     _stopped = false;
-    _paused = false;
+    _paused = paused;
     _started = false;
     _playError = null;
+    currentSection = null;
+    currentUtterance = null;
     error = null;
     speaker = null;
-    state = SpeechState.preparing;
+    state = paused ? SpeechState.paused : SpeechState.preparing;
     _run = _read(
-      title,
-      sectionName,
+      session.title,
+      session.sectionName,
       index,
-      length,
-      loadSpeech,
-      showSection,
-      continueToEnd,
-      startUtterance,
+      session.length,
+      session.loadSpeech,
+      session.showSection,
+      session.continueToEnd,
+      utterance,
       resumePassage,
-      onProgress,
+      session.onProgress,
     );
     notifyListeners();
+  }
+
+  _NarrationSession _updatedSession(_NarrationSession session) =>
+      _NarrationSession(
+        title: session.title,
+        sectionName: session.sectionName,
+        bookId: session.bookId,
+        length: session.length,
+        loadSpeech: session.loadSpeech,
+        showSection: session.showSection,
+        continueToEnd: _continueToEnd,
+        settings: settings,
+        onProgress: session.onProgress,
+      );
+
+  /// Volume and speed affect the current player immediately. Synthesis changes
+  /// replace queued clips from the current sentence after the control settles.
+  Future<void> applySettings(
+    VoiceSettings next, {
+    bool? continueToEnd,
+    bool rebuild = false,
+  }) async {
+    if (_preparation != null &&
+        !active &&
+        !navigating &&
+        next.engine != VoiceEngine.supertonic) {
+      SupertonicNarration.cancel();
+    }
+    settings = next;
+    if (_closed) return;
+    if (continueToEnd != null) _continueToEnd = continueToEnd;
+    final session = _session;
+    if ((!active && !navigating) || session == null) return;
+    _settingsTimer?.cancel();
+    final base = session.settings;
+    final playerRate =
+        base.engine == VoiceEngine.phonon ||
+            base.engine == VoiceEngine.pocket ||
+            base.engine == VoiceEngine.supertonic ||
+            base.lfm3Narration
+        ? 1.0
+        : base.speed;
+    // Send both changes before awaiting either, preserving slider event order.
+    final volume = _player.setVolume(next.volume);
+    final speed = _player.setSpeed(next.speed / playerRate);
+    if (rebuild ||
+        !_sameSynthesis(base, next) ||
+        _continueToEnd != session.continueToEnd) {
+      _settingsTimer = Timer(
+        const Duration(milliseconds: 180),
+        () => unawaited(_restartForSettings()),
+      );
+    }
+    await Future.wait([volume, speed]);
+  }
+
+  bool _sameSynthesis(VoiceSettings a, VoiceSettings b) =>
+      (
+        a.engine,
+        a.voice,
+        a.systemVoice,
+        a.phononVoice,
+        a.pocketVoice,
+        a.supertonicVoice,
+        a.supertonicLanguage,
+        a.pauses,
+        a.pitch,
+        a.punctuation,
+        a.characterVoices,
+        a.batterySaver,
+        a.lfm3Narration,
+        a.lfm3Voice,
+      ) ==
+      (
+        b.engine,
+        b.voice,
+        b.systemVoice,
+        b.phononVoice,
+        b.pocketVoice,
+        b.supertonicVoice,
+        b.supertonicLanguage,
+        b.pauses,
+        b.pitch,
+        b.punctuation,
+        b.characterVoices,
+        b.batterySaver,
+        b.lfm3Narration,
+        b.lfm3Voice,
+      );
+
+  Future<void> _restartForSettings() async {
+    final session = _session;
+    if (_closed || navigating || !active || session == null) return;
+    _settingsTimer?.cancel();
+    final token = ++_navigationToken;
+    navigating = true;
+    final section = currentSection ?? _startIndex;
+    final utterance = currentUtterance ?? _startUtterance;
+    final resumePassage = passage ?? _startPassage;
+    final wasPaused = _paused;
+    notifyListeners();
+    try {
+      await _stopRun();
+      if (_closed || token != _navigationToken) return;
+      _startSession(
+        _updatedSession(session),
+        section,
+        utterance,
+        resumePassage: resumePassage,
+        paused: wasPaused,
+      );
+    } finally {
+      if (token == _navigationToken) navigating = false;
+      if (!_closed) notifyListeners();
+    }
+  }
+
+  Future<void> previousSentence() => _navigateSentence(-1);
+  Future<void> nextSentence() => _navigateSentence(1);
+
+  Future<void> _navigateSentence(int direction) async {
+    final session = _session;
+    if (direction < 0 ? !canPreviousSentence : !canNextSentence) return;
+    if (!active || navigating || session == null || currentUtterance == null) {
+      return;
+    }
+    _settingsTimer?.cancel();
+    final token = ++_navigationToken;
+    navigating = true;
+    notifyListeners();
+    final wasPaused = _paused;
+    var section = currentSection!;
+    var utterance = currentUtterance! + direction;
+    try {
+      // Cancel in-flight synthesis immediately. Replaying uses cached clips.
+      await _stopRun();
+      while (section >= 0 && section < session.length) {
+        if (_closed || token != _navigationToken) return;
+        final speeches = await session.loadSpeech(section);
+        if (_closed || token != _navigationToken) return;
+        if (utterance >= 0 && utterance < speeches.length) {
+          if (sleepTimer.atSectionEnd) sleepTimer.setSectionEnd(section);
+          _startSession(
+            _updatedSession(session),
+            section,
+            utterance,
+            paused: wasPaused,
+          );
+          return;
+        }
+        if (!session.continueToEnd && direction > 0) return;
+        section += direction;
+        if (direction < 0) {
+          if (section < 0) break;
+          final previous = await session.loadSpeech(section);
+          utterance = previous.length - 1;
+        } else {
+          utterance = 0;
+        }
+      }
+      // At a boundary, keep the last valid sentence and pause state.
+      if (!_closed && token == _navigationToken) {
+        _startSession(
+          _updatedSession(session),
+          currentSection!,
+          currentUtterance!,
+          paused: wasPaused,
+        );
+      }
+    } catch (failure) {
+      if (!_closed && token == _navigationToken) {
+        error = 'Could not change sentence. Try Read aloud again.';
+      }
+    } finally {
+      if (token == _navigationToken) navigating = false;
+      if (!_closed) notifyListeners();
+    }
   }
 
   Future<void> _read(
@@ -477,6 +808,18 @@ class Narrator extends ChangeNotifier {
       if (!_stopped && tag is MediaItem && tag.id != currentClip) {
         currentClip = tag.id;
         if (clips[tag.id] case final clip?) {
+          if (sleepTimer.section != null &&
+              sleepTimer.section == currentSection &&
+              currentSection != clip.section) {
+            sleepTimer.reachedSectionEnd(currentSection!);
+            if (_stopped) {
+              _wake();
+              return;
+            }
+          }
+          currentSection = clip.section;
+          currentUtterance = clip.utterance;
+          _currentSectionLength = clip.sectionLength;
           passage = clip.text;
           speaker = clip.speaker;
           showSection(clip.section);
@@ -490,34 +833,52 @@ class Narrator extends ChangeNotifier {
       _playError = error;
       _wake();
     });
-    final selected = settings;
+    final selected = _session!.settings;
     final phonon = selected.engine == VoiceEngine.phonon;
+    final pocket = selected.engine == VoiceEngine.pocket;
+    final supertonic = selected.engine == VoiceEngine.supertonic;
     final systemVoice = selected.engine == VoiceEngine.system;
-    final lfm3Narration = selected.lfm3Narration && !phonon;
+    final lfm3Narration =
+        selected.lfm3Narration && !phonon && !pocket && !supertonic;
     final queueLimit = selected.batterySaver ? 2 : prefetch;
     final end = continueToEnd ? length : (index + 1).clamp(0, length);
     try {
-      final session = await AudioSession.instance;
-      await session.configure(const AudioSessionConfiguration.speech());
+      if (configureAudioSession case final configure?) {
+        await configure();
+      } else {
+        final session = await AudioSession.instance;
+        await session.configure(const AudioSessionConfiguration.speech());
+      }
       await _player.setVolume(selected.volume);
-      await _player.setSpeed(phonon || lfm3Narration ? selected.speed : 1);
+      await _player.setSpeed(
+        phonon || pocket || supertonic || lfm3Narration ? selected.speed : 1,
+      );
+      if (pocket && synthesizeClip == null && !await PocketTts.isInstalled()) {
+        throw const SpeechFailure('Download the Pocket TTS model in Settings.');
+      }
+      if (supertonic &&
+          synthesizeClip == null &&
+          !await SupertonicModel.isInstalled()) {
+        throw const SpeechFailure(
+          'Download the Supertonic 3 model in Settings.',
+        );
+      }
       if (phonon && !await PhononModel.isInstalled()) {
         throw const SpeechFailure(
-          'Download the experimental Phonon model in Read aloud settings.',
+          'Download the experimental Phonon model in Settings.',
         );
       }
       if (lfm3Narration && !await Lfm3AudioModel.isInstalled()) {
         throw const SpeechFailure(
-          'Download the LFM3-Audio narration model in Read aloud settings.',
+          'Download the LFM3-Audio narration model in Settings.',
         );
       }
       if (systemVoice && (selected.systemVoice ?? '').isEmpty) {
-        throw const SpeechFailure(
-          'Choose an iPhone voice in Read aloud settings.',
-        );
+        throw const SpeechFailure('Choose an iPhone voice in Settings.');
       }
       var clipNumber = 0;
       for (var section = index; section < end && !_stopped; section++) {
+        if (sleepTimer.section != null && section > sleepTimer.section!) break;
         final utterances = await loadSpeech(section);
         if (_stopped) break;
         if (utterances.isEmpty) continue;
@@ -537,6 +898,9 @@ class Narrator extends ChangeNotifier {
           utteranceIndex < utterances.length && !_stopped;
           utteranceIndex++
         ) {
+          if (sleepTimer.section != null && section > sleepTimer.section!) {
+            break;
+          }
           final speech = utterances[utteranceIndex];
           final text = speech.text.trim();
           if (text.isEmpty) continue;
@@ -544,12 +908,13 @@ class Narrator extends ChangeNotifier {
           // the queue survives backgrounded generation and chapter changes.
           if (!await _waitFor(
             () =>
+                _player.processingState == ProcessingState.completed ||
                 _player.audioSources.length - (_player.currentIndex ?? 0) <
-                queueLimit,
+                    queueLimit,
           )) {
             break;
           }
-          if (!await _waitWhilePaused()) break;
+          if (_started && !await _waitWhilePaused()) break;
           final played = _player.currentIndex ?? 0;
           if (played > 0) {
             final finished = _player.audioSources
@@ -574,52 +939,120 @@ class Narrator extends ChangeNotifier {
           final speechSettings = selected.withChanges(
             voice: speech.kokoroVoice,
             systemVoice: speech.systemVoice,
-            speed: lfm3Narration ? 1 : selected.speed,
+            speed: lfm3Narration || pocket || supertonic ? 1 : selected.speed,
           );
           final extension = systemVoice && !useLfm3 ? 'caf' : 'wav';
           final clip = '${audio.path}/${clipNumber++}.$extension';
-          if (useLfm3) {
-            try {
-              await Lfm3Audio.synthesizeToFile(
-                text: prepareSpeech(text, selected.punctuation),
-                voice: selected.lfm3Voice,
-                path: clip,
-              );
-            } on Lfm3AudioException catch (error) {
-              throw SpeechFailure(error.message);
+          final bookId = _session!.bookId;
+          final identity = <String, Object?>{
+            'version': 1,
+            'runtime': 'mediapipe-0.2.1:llamadart-0.19.3',
+            'engine': useLfm3 ? 'lfm3-audio' : selected.engine.name,
+            'text': prepareSpeech(text, selected.punctuation),
+            'voice': speechSettings.voice,
+            'systemVoice': speechSettings.systemVoice,
+            'phononVoice': selected.phononVoice,
+            'lfm3Voice': selected.lfm3Voice,
+            'speed': speechSettings.speed,
+            'pauses': selected.pauses,
+            'pitch': selected.pitch,
+            if (systemVoice) 'volume': selected.volume,
+            'batterySaver': selected.batterySaver,
+            'os': Platform.operatingSystemVersion,
+            if (phonon) 'phononRevision': await PhononModel.cacheRevision(),
+            if (pocket) ...{
+              'pocketVoice': selected.pocketVoice,
+              'pocketRevision': PocketTts.revision,
+            },
+            if (supertonic) ...{
+              'supertonicVoice': selected.supertonicVoice,
+              'supertonicLanguage': selected.supertonicLanguage,
+              'supertonicRevision': SupertonicModel.revision,
+            },
+          };
+          final key = AudioClipCache.clipKey(identity);
+          final cached =
+              bookId != null && await _cache.copyTo(bookId, key, clip);
+          if (_stopped) break;
+          if (!cached) {
+            if (synthesizeClip case final synthesize?) {
+              await synthesize(speech, speechSettings, clip);
+            } else {
+              if (useLfm3) {
+                try {
+                  await Lfm3Audio.synthesizeToFile(
+                    text: prepareSpeech(text, selected.punctuation),
+                    voice: selected.lfm3Voice,
+                    path: clip,
+                  );
+                } on Lfm3AudioException catch (error) {
+                  throw SpeechFailure(error.message);
+                }
+              } else if (supertonic) {
+                try {
+                  await SupertonicNarration.synthesizeToFile(
+                    text: prepareSpeech(text, selected.punctuation),
+                    path: clip,
+                    voice: selected.supertonicVoice,
+                    language: selected.supertonicLanguage,
+                    pauses: selected.pauses,
+                  );
+                } catch (error) {
+                  throw SpeechFailure(
+                    'Supertonic 3 could not narrate this passage: $error',
+                  );
+                }
+              } else if (pocket) {
+                try {
+                  await PocketTts.synthesizeToFile(
+                    text: prepareSpeech(text, selected.punctuation),
+                    path: clip,
+                    voice: selected.pocketVoice,
+                    pauses: selected.pauses,
+                  );
+                } catch (error) {
+                  throw SpeechFailure(
+                    'Pocket TTS could not narrate this passage: $error',
+                  );
+                }
+              } else if (phonon) {
+                try {
+                  await PhononNarration.synthesizeToFile(
+                    text: prepareSpeech(text, selected.punctuation),
+                    path: clip,
+                    voice: selected.phononVoice,
+                  );
+                } on PhononException catch (error) {
+                  throw SpeechFailure(error.message);
+                }
+              } else if (systemVoice) {
+                final success = await SystemVoices.synthesize(
+                  text: prepareSpeech(text, selected.punctuation),
+                  path: clip,
+                  settings: speechSettings,
+                );
+                if (!success) {
+                  throw const SpeechFailure(
+                    'This iPhone voice could not speak the passage. '
+                    'Choose another voice, or switch back to Kokoro.',
+                  );
+                }
+              } else {
+                final worker = await _KokoroPool.acquire(
+                  speaker: selected.voice,
+                  batterySaver: selected.batterySaver,
+                );
+                await worker.generate(text, speechSettings, clip);
+              }
             }
-          } else if (phonon) {
-            try {
-              await PhononNarration.synthesizeToFile(
-                text: prepareSpeech(text, selected.punctuation),
-                path: clip,
-                voice: selected.phononVoice,
-              );
-            } on PhononException catch (error) {
-              throw SpeechFailure(error.message);
+            if (!_stopped && bookId != null) {
+              await _cache.put(bookId, key, clip, valid: () => !_stopped);
             }
-          } else if (systemVoice) {
-            final success = await SystemVoices.synthesize(
-              text: prepareSpeech(text, selected.punctuation),
-              path: clip,
-              settings: speechSettings,
-            );
-            if (!success) {
-              throw const SpeechFailure(
-                'This iPhone voice could not speak the passage. '
-                'Choose another voice, or switch back to Kokoro.',
-              );
-            }
-          } else {
-            final worker = await _KokoroPool.acquire(
-              speaker: selected.voice,
-              batterySaver: selected.batterySaver,
-            );
-            await worker.generate(text, speechSettings, clip);
           }
           if (_stopped) break;
           final utterance = _ClipInfo(
             section: section,
+            sectionLength: utterances.length,
             utterance: utteranceIndex,
             text: speech.text,
             speaker: speech.speaker,
@@ -665,6 +1098,9 @@ class Narrator extends ChangeNotifier {
       await _waitFor(
         () => _player.processingState == ProcessingState.completed,
       );
+      if (!_stopped && currentSection != null) {
+        sleepTimer.reachedSectionEnd(currentSection!);
+      }
     } catch (failure, stack) {
       if (!_stopped) {
         if (kDebugMode) debugPrint('Narration failed: $failure\n$stack');
@@ -676,6 +1112,7 @@ class Narrator extends ChangeNotifier {
       await playback.cancel();
       await sequence.cancel();
       await errors.cancel();
+      if (!navigating) sleepTimer.cancel();
       _KokoroPool.release(
         after: selected.batterySaver
             ? const Duration(seconds: 30)
@@ -683,6 +1120,20 @@ class Narrator extends ChangeNotifier {
       );
       if (phonon) {
         PhononNarration.release(
+          after: selected.batterySaver
+              ? const Duration(seconds: 30)
+              : const Duration(seconds: 90),
+        );
+      }
+      if (pocket) {
+        pocketSpeech.release(
+          after: selected.batterySaver
+              ? const Duration(seconds: 30)
+              : const Duration(seconds: 90),
+        );
+      }
+      if (supertonic) {
+        SupertonicNarration.release(
           after: selected.batterySaver
               ? const Duration(seconds: 30)
               : const Duration(seconds: 90),
@@ -713,17 +1164,27 @@ class Narrator extends ChangeNotifier {
     final needle = (passage ?? '').trim().toLowerCase();
     if (needle.isEmpty) return start;
     final prefix = needle.substring(0, needle.length.clamp(0, 64));
+    bool matches(int index) {
+      final text = utterances[index].text.trim().toLowerCase();
+      return text.isNotEmpty &&
+          (text.startsWith(prefix) || prefix.startsWith(text));
+    }
+
+    if (start < utterances.length && matches(start)) return start;
     for (var i = 0; i < utterances.length; i++) {
-      final text = utterances[i].text.trim().toLowerCase();
-      if (text.startsWith(prefix)) return i;
-      if (text.length > 24 && prefix.startsWith(text)) return i;
+      if (matches(i)) return i;
+    }
+    if (prefix.length >= 12) {
+      for (var i = 0; i < utterances.length; i++) {
+        if (utterances[i].text.toLowerCase().contains(prefix)) return i;
+      }
     }
     return start;
   }
 
   /// Plays a short sample with [settings], without starting a full narration.
   Future<void> preview(VoiceSettings settings) async {
-    if (_closed || active) {
+    if (_closed || active || navigating) {
       throw const SpeechFailure('Stop Read aloud before previewing a voice.');
     }
     await stopPreview();
@@ -737,7 +1198,9 @@ class Narrator extends ChangeNotifier {
     try {
       final session = await AudioSession.instance;
       await session.configure(const AudioSessionConfiguration.speech());
-      if (settings.lfm3Narration) {
+      if (settings.lfm3Narration &&
+          settings.engine != VoiceEngine.pocket &&
+          settings.engine != VoiceEngine.supertonic) {
         if (!await Lfm3AudioModel.isInstalled()) {
           throw const SpeechFailure(
             'Download the LFM3-Audio narration model first.',
@@ -755,6 +1218,65 @@ class Narrator extends ChangeNotifier {
           );
         } on Lfm3AudioException catch (error) {
           throw SpeechFailure(error.message);
+        }
+        if (token != _previewToken) return;
+        await _previewPlayer.setAudioSource(
+          AudioSource.file(
+            path,
+            tag: MediaItem(id: path, title: 'Voice preview'),
+          ),
+        );
+        await _previewPlayer.setVolume(settings.volume);
+        await _previewPlayer.setSpeed(settings.speed);
+        await _previewPlayer.play();
+        return;
+      }
+      if (settings.engine == VoiceEngine.supertonic) {
+        if (!await SupertonicModel.isInstalled()) {
+          throw const SpeechFailure('Download the Supertonic 3 model first.');
+        }
+        audio = await (await getTemporaryDirectory()).createTemp(
+          'relay-voice-preview-',
+        );
+        final path = '${audio.path}/preview.wav';
+        await SupertonicNarration.synthesizeToFile(
+          text: text,
+          path: path,
+          voice: settings.supertonicVoice,
+          language: settings.supertonicLanguage,
+          pauses: settings.pauses,
+        );
+        if (token != _previewToken) return;
+        await _previewPlayer.setAudioSource(
+          AudioSource.file(
+            path,
+            tag: MediaItem(id: path, title: 'Voice preview'),
+          ),
+        );
+        await _previewPlayer.setVolume(settings.volume);
+        await _previewPlayer.setSpeed(settings.speed);
+        await _previewPlayer.play();
+        return;
+      }
+      if (settings.engine == VoiceEngine.pocket) {
+        if (!await PocketTts.isInstalled()) {
+          throw const SpeechFailure('Download the Pocket TTS model first.');
+        }
+        audio = await (await getTemporaryDirectory()).createTemp(
+          'relay-voice-preview-',
+        );
+        final path = '${audio.path}/preview.wav';
+        try {
+          await PocketTts.synthesizeToFile(
+            text: text,
+            path: path,
+            voice: settings.pocketVoice,
+            pauses: settings.pauses,
+          );
+        } catch (error) {
+          throw SpeechFailure(
+            'Pocket TTS could not preview this voice: $error',
+          );
         }
         if (token != _previewToken) return;
         await _previewPlayer.setAudioSource(
@@ -835,6 +1357,10 @@ class Narrator extends ChangeNotifier {
         // Nothing to clear after dispose.
       }
       _KokoroPool.release(after: const Duration(seconds: 60));
+      if (settings.engine == VoiceEngine.pocket) pocketSpeech.release();
+      if (settings.engine == VoiceEngine.supertonic) {
+        SupertonicNarration.release();
+      }
       try {
         await audio?.delete(recursive: true);
       } catch (_) {
@@ -849,8 +1375,12 @@ class Narrator extends ChangeNotifier {
 
   Future<void> stopPreview() async {
     _previewToken++;
-    Lfm3Audio.cancel();
     if (_previewing) {
+      Lfm3Audio.cancel();
+      kokoroSpeech.cancel();
+      phononSpeech.cancel();
+      pocketSpeech.cancel();
+      SupertonicNarration.cancel();
       _previewing = false;
       if (!_closed) notifyListeners();
     }
@@ -920,10 +1450,27 @@ class Narrator extends ChangeNotifier {
   }
 
   Future<void> stop() async {
+    _settingsTimer?.cancel();
+    _navigationToken++;
+    navigating = false;
+    sleepTimer.cancel();
+    final preparation = _preparation;
+    if (preparation != null) SupertonicNarration.cancel();
+    await _stopRun();
+    if (preparation != null) {
+      await preparation.catchError((Object _) {});
+    }
+  }
+
+  Future<void> _stopRun() async {
     final run = _run;
     if (run == null) return;
     _stopped = true;
     Lfm3Audio.cancel();
+    kokoroSpeech.cancel();
+    phononSpeech.cancel();
+    pocketSpeech.cancel();
+    SupertonicNarration.cancel();
     _wake();
     await _player.pause();
     await run;
@@ -931,148 +1478,66 @@ class Narrator extends ChangeNotifier {
 
   Future<void> setVolume(double volume) => _player.setVolume(volume);
 
+  /// Prepare only the chosen narrator after a book is visible. No audio is
+  /// generated and preparation never changes playback/checkpoint/timer state.
+  Future<void> prepareSelectedVoice() {
+    if (_closed ||
+        active ||
+        navigating ||
+        _previewing ||
+        settings.engine != VoiceEngine.supertonic ||
+        synthesizeClip != null && prepareClipEngine == null) {
+      return Future.value();
+    }
+    return _preparation ??=
+        Future.sync(prepareClipEngine ?? SupertonicNarration.ensureLoaded)
+            .whenComplete(() {
+              _preparation = null;
+              SupertonicNarration.release(
+                after: settings.batterySaver
+                    ? const Duration(seconds: 30)
+                    : const Duration(seconds: 90),
+              );
+            });
+  }
+
   void _setState(SpeechState next) {
     if (_closed || state == next) return;
     state = next;
     notifyListeners();
   }
 
-  Future<void> close() async {
+  Future<void> close() => _closing ??= _close();
+
+  Future<void> _close() async {
     _closed = true;
     await stopPreview();
     await stop();
     await _KokoroPool.unload();
+    await pocketSpeech.unload();
+    await SupertonicNarration.unload();
     await _previewPlayer.dispose();
     await _player.dispose();
+    sleepTimer.dispose();
     super.dispose();
   }
 }
 
-const modelFiles = [
-  'model.int8.onnx',
-  'voices.bin',
-  'tokens.txt',
-  'lexicon-us-en.txt',
-  'lexicon-gb-en.txt',
-];
-
-Future<String> _modelDirectory() async {
-  final assets = await AssetManifest.loadFromAssetBundle(rootBundle);
-  if (!modelFiles.every(
-    (name) => assets.listAssets().contains('assets/kokoro-v1/$name'),
-  )) {
-    throw const SpeechFailure(
-      'Kokoro voice files are missing. Run scripts/prepare-reader-voice.sh and rebuild Relay Reader.',
-    );
-  }
-
-  final root = await getApplicationSupportDirectory();
-  final directory = await Directory('${root.path}/kokoro-int8-v1')
-      .create(recursive: true);
-  for (final name in modelFiles) {
-    final file = File('${directory.path}/$name');
-    if (await file.exists() && await file.length() > 0) continue;
-    final data = await rootBundle.load('assets/kokoro-v1/$name');
-    final temporary = await File('${file.path}.partial').writeAsBytes(
-      data.buffer.asUint8List(data.offsetInBytes, data.lengthInBytes),
-      flush: true,
-    );
-    await temporary.rename(file.path);
-  }
-  return directory.path;
-}
-
-/// Keeps the Kokoro model warm between clips and playback sessions, then
-/// releases it after an idle period. Reloading the model for every start was
-/// both slow and battery-hungry, while keeping it forever wastes memory.
+/// Shared MediaPipe task, kept warm across utterances and voice switches.
 abstract final class _KokoroPool {
-  static _VoiceWorker? _worker;
-  static String? _model;
-  static String? _dialect;
-  static int? _threads;
-  static Timer? _idle;
-  static Future<void>? _closing;
-  static Future<String>? _modelFuture;
-
-  static Future<String> modelDirectory() async {
-    final cached = _modelFuture;
-    if (cached != null) return cached;
-    final future = _modelDirectory();
-    _modelFuture = future;
-    try {
-      return await future;
-    } catch (_) {
-      if (identical(_modelFuture, future)) _modelFuture = null;
-      rethrow;
-    }
-  }
-
-  static int _threadCount(bool batterySaver) {
-    final maximum = batterySaver ? 2 : 3;
-    return Platform.numberOfProcessors.clamp(1, maximum);
-  }
-
   static Future<_VoiceWorker> acquire({
     required int speaker,
     required bool batterySaver,
-  }) async {
-    final closing = _closing;
-    if (closing != null) await closing;
-    final model = await modelDirectory();
-    final dialect = speaker >= 20 ? 'gb' : 'us';
-    final threads = _threadCount(batterySaver);
-    _idle?.cancel();
-    _idle = null;
-    final current = _worker;
-    if (current != null &&
-        !current.exited &&
-        _model == model &&
-        _dialect == dialect &&
-        _threads == threads) {
-      return current;
-    }
-    await _closeNow();
-    final worker = await _VoiceWorker.start(model, speaker, threads: threads);
-    _worker = worker;
-    _model = model;
-    _dialect = dialect;
-    _threads = threads;
-    return worker;
-  }
-
-  static void release({Duration after = const Duration(seconds: 60)}) {
-    _idle?.cancel();
-    _idle = Timer(after, () => unawaited(_closeNow()));
-  }
-
-  static Future<void> unload() async {
-    _idle?.cancel();
-    _idle = null;
-    await _closeNow();
-  }
-
-  static Future<void> _closeNow() async {
-    final worker = _worker;
-    if (worker == null) return;
-    _worker = null;
-    _model = null;
-    _dialect = null;
-    _threads = null;
-    final future = worker.close();
-    _closing = future;
-    try {
-      await future;
-    } catch (_) {
-      // A worker that already died cannot be closed; the next worker replaces it.
-    } finally {
-      if (identical(_closing, future)) _closing = null;
-    }
-  }
+  }) async => _VoiceWorker(batterySaver);
+  static void release({Duration after = const Duration(seconds: 60)}) =>
+      kokoroSpeech.release(after: after);
+  static Future<void> unload() => kokoroSpeech.unload();
 }
 
 class _ClipInfo {
   const _ClipInfo({
     required this.section,
+    required this.sectionLength,
     required this.utterance,
     required this.text,
     required this.speaker,
@@ -1080,127 +1545,29 @@ class _ClipInfo {
   });
 
   final int section;
+  final int sectionLength;
   final int utterance;
   final String text;
   final String? speaker;
   final SpeechUtterance speech;
 }
 
-typedef _VoiceRequest = (String text, VoiceSettings settings, String wav);
-
 class _VoiceWorker {
-  _VoiceWorker(this._commands, this._replies);
-
-  final SendPort _commands;
-  final StreamIterator<dynamic> _replies;
-  bool _exited = false;
-
-  bool get exited => _exited;
-
-  static Future<_VoiceWorker> start(
-    String model,
-    int speaker, {
-    required int threads,
-  }) async {
-    final events = ReceivePort();
-    final replies = StreamIterator(events);
-    try {
-      await Isolate.spawn(
-        _speak,
-        (model, speaker >= 20 ? 'gb' : 'us', threads, events.sendPort),
-        onError: events.sendPort,
-        onExit: events.sendPort,
-      );
-      if (await replies.moveNext() && replies.current is SendPort) {
-        return _VoiceWorker(replies.current as SendPort, replies);
-      }
-      if (kDebugMode && replies.current is List<Object?>) {
-        final details = replies.current as List<Object?>;
-        debugPrint(
-          'Kokoro worker initialization failed: ${details.join('\n')}',
-        );
-      }
-      throw const SpeechFailure('Kokoro could not start on this device.');
-    } catch (_) {
-      await replies.cancel();
-      rethrow;
-    }
-  }
+  _VoiceWorker(this.batterySaver);
+  final bool batterySaver;
 
   Future<void> generate(String text, VoiceSettings settings, String wav) async {
-    _commands.send((prepareSpeech(text, settings.punctuation), settings, wav));
-    _exited = !await _replies.moveNext() || _replies.current == null;
-    if (_exited || _replies.current != true) {
-      throw const SpeechFailure(
-        'Kokoro could not narrate this passage. The bundled voices are English.',
-      );
-    }
-  }
-
-  Future<void> close() async {
-    final wasExited = _exited;
-    _exited = true;
     try {
-      if (!wasExited) {
-        _commands.send(null);
-        await _replies.moveNext();
-      }
-    } finally {
-      await _replies.cancel();
+      await kokoroSpeech.synthesizeToFile(
+        text: prepareSpeech(text, settings.punctuation),
+        voice: kokoroVoiceIds[settings.voice],
+        path: wav,
+        speed: settings.speed,
+        pauses: settings.pauses,
+        batterySaver: batterySaver,
+      );
+    } catch (error) {
+      throw SpeechFailure('Kokoro could not narrate this passage: $error');
     }
-  }
-}
-
-Future<void> _speak((String, String, int, SendPort) args) async {
-  final (model, dialect, threads, reply) = args;
-  sherpa.initBindings();
-  final tts = sherpa.OfflineTts(
-    sherpa.OfflineTtsConfig(
-      model: sherpa.OfflineTtsModelConfig(
-        numThreads: threads,
-        kokoro: sherpa.OfflineTtsKokoroModelConfig(
-          model: '$model/model.int8.onnx',
-          voices: '$model/voices.bin',
-          tokens: '$model/tokens.txt',
-          lexicon: '$model/lexicon-$dialect-en.txt',
-        ),
-      ),
-    ),
-  );
-  final commands = ReceivePort();
-  try {
-    if (tts.numSpeakers < 28) {
-      throw StateError('Unexpected Kokoro speaker count');
-    }
-    reply.send(commands.sendPort);
-    await for (final command in commands) {
-      if (command == null) break;
-      final (text, settings, path) = command as _VoiceRequest;
-      try {
-        final audio = tts.generateWithConfig(
-          text: text,
-          config: sherpa.OfflineTtsGenerationConfig(
-            sid: settings.voice,
-            speed: settings.speed,
-            silenceScale: settings.pauses,
-            extra: const {'max_words_in_sentence': 36},
-          ),
-        );
-        final success =
-            audio.samples.isNotEmpty &&
-            sherpa.writeWave(
-              filename: path,
-              samples: audio.samples,
-              sampleRate: audio.sampleRate,
-            );
-        reply.send(success);
-      } catch (error, stack) {
-        if (kDebugMode) debugPrint('Kokoro synthesis failed: $error\n$stack');
-        reply.send(false);
-      }
-    }
-  } finally {
-    commands.close();
-    tts.free();
   }
 }

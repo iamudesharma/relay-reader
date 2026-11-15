@@ -18,5 +18,8 @@ import UIKit
     RelayPhonon.shared.register(
       messenger: engineBridge.applicationRegistrar.messenger()
     )
+    RelaySupertonic.shared.register(
+      messenger: engineBridge.applicationRegistrar.messenger()
+    )
   }
 }

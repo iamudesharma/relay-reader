@@ -6,6 +6,8 @@ import 'package:archive/archive_io.dart';
 import 'package:flutter/services.dart';
 import 'package:path_provider/path_provider.dart';
 
+import 'mediapipe_tts.dart';
+
 class PhononException implements Exception {
   const PhononException(this.message);
   final String message;
@@ -29,7 +31,7 @@ bool _appleVersionSupported() {
 /// The model is downloaded only after the reader explicitly chooses the
 /// experimental engine. It runs on the Apple Neural Engine through the native
 /// relay_reader/phonon bridge, so narration works without a connection.
-abstract final class PhononModel {
+abstract final class NativePhononModel {
   static const version = '0.7.0';
   static const displaySize = '137 MB';
   static const installedSize = 'about 190 MB';
@@ -207,7 +209,7 @@ abstract final class PhononModel {
   }
 
   /// Adds a voice file created in Gradium Studio, then reloads the model so
-  /// the new voice appears in [PhononNarration.voices]. Cloning itself happens
+  /// the new voice appears in [NativePhononNarration.voices]. Cloning itself happens
   /// in Gradium Studio/API; Phonon does not enrol a recording on-device.
   static Future<String> importVoice(File source) async {
     if (!supported) {
@@ -234,8 +236,8 @@ abstract final class PhononModel {
     final target = File('${voices.path}/$name');
     await source.copy(target.path);
 
-    await PhononNarration.unload();
-    final loaded = await PhononNarration.voices(refresh: true);
+    await NativePhononNarration.unload();
+    final loaded = await NativePhononNarration.voices(refresh: true);
     if (loaded.isEmpty) {
       throw const PhononException(
         'The voice file was added but Phonon did not load any voices.',
@@ -245,8 +247,8 @@ abstract final class PhononModel {
   }
 
   static Future<void> delete() async {
-    await PhononNarration.unload();
-    await PhononNarration.stopPreview();
+    await NativePhononNarration.unload();
+    await NativePhononNarration.stopPreview();
     try {
       final root = await _root();
       if (await root.exists()) await root.delete(recursive: true);
@@ -258,7 +260,7 @@ abstract final class PhononModel {
 
 /// Dart side of the native Core ML bridge. The native side owns the model
 /// handle; this class keeps narration and preview calls serialized.
-abstract final class PhononNarration {
+abstract final class NativePhononNarration {
   static const _channel = MethodChannel('relay_reader/phonon');
   static Timer? _releaseTimer;
   static List<String> _voices = const [];
@@ -295,7 +297,7 @@ abstract final class PhononNarration {
         'Phonon is available only on Apple platforms.',
       );
     }
-    final directory = await PhononModel.directory();
+    final directory = await NativePhononModel.directory();
     try {
       final values = await _channel.invokeMethod<List<dynamic>>('load', {
         'path': directory.path,
@@ -380,5 +382,152 @@ abstract final class PhononNarration {
     } catch (_) {
       // The engine may already be gone.
     }
+  }
+}
+
+/// MediaPipe handles bundled voices; the existing Core ML bridge remains for
+/// installed and imported Gradium Studio voices, whose format is incompatible.
+abstract final class PhononModel {
+  static const displaySize = '87 MB';
+  static const installedSize = 'about 87 MB (plus any cloned voice runtime)';
+  static const license = 'Apache 2.0';
+  static const zipBytes = 87000000;
+  static bool get supported => NativePhononModel.supported;
+  static Future<bool> isInstalled() async {
+    if (!supported) return false;
+    try {
+      return await MediaPipeModels.phononInstalled() ||
+          await NativePhononModel.isInstalled();
+    } catch (_) {
+      return false;
+    }
+  }
+
+  /// Invalidate clips when a legacy model or any imported voice is replaced.
+  static Future<Object> cacheRevision() async {
+    final root = await NativePhononModel.directory();
+    final entries = <String>[];
+    for (final folder in [root, Directory('${root.path}/voices')]) {
+      if (!await folder.exists()) continue;
+      await for (final file in folder.list(followLinks: false)) {
+        if (file is! File) continue;
+        final stat = await file.stat();
+        entries.add(
+          '${file.uri.pathSegments.last}:${stat.size}:${stat.modified.microsecondsSinceEpoch}',
+        );
+      }
+    }
+    entries.sort();
+    return ['mediapipe-phonon-b33a9a0d', NativePhononModel.version, entries];
+  }
+
+  static Future<void> download({
+    required void Function(int, int) onProgress,
+  }) async {
+    if (!supported) {
+      throw const PhononException(
+        'Phonon is available only on supported Apple platforms.',
+      );
+    }
+    try {
+      await MediaPipeModels.downloadPhonon(onProgress);
+      await PhononNarration.unload();
+    } catch (error) {
+      throw PhononException('The Phonon model could not be downloaded: $error');
+    }
+  }
+
+  static Future<String> importVoice(
+    File source, {
+    void Function(int, int)? onProgress,
+  }) async {
+    if (!source.path.toLowerCase().endsWith('.safetensors')) {
+      throw const PhononException(
+        'Choose a Phonon .safetensors voice file from Gradium Studio.',
+      );
+    }
+    if (!await NativePhononModel.isInstalled()) {
+      await NativePhononModel.download(onProgress: onProgress ?? (_, _) {});
+    }
+    final voice = await NativePhononModel.importVoice(source);
+    await PhononNarration.unload();
+    return voice;
+  }
+
+  static Future<void> delete() async {
+    try {
+      await PhononNarration.unload();
+      await MediaPipeModels.deletePhonon();
+      await NativePhononModel.delete();
+    } catch (error) {
+      throw PhononException('The Phonon model could not be deleted: $error');
+    }
+  }
+}
+
+abstract final class PhononNarration {
+  static bool get supported => NativePhononNarration.supported;
+  static Future<bool> available() async => supported;
+  static Future<List<String>> voices({bool refresh = false}) async {
+    if (!supported) return const [];
+    try {
+      final native = await NativePhononModel.isInstalled()
+          ? await NativePhononNarration.voices(refresh: refresh)
+          : <String>[];
+      final mediaPipe = await MediaPipeModels.phononInstalled()
+          ? await phononSpeech.voices()
+          : <String>[];
+      return {...native, ...mediaPipe}.toList();
+    } catch (error) {
+      throw PhononException('Phonon could not load its voices: $error');
+    }
+  }
+
+  static Future<List<String>> ensureLoaded() => voices();
+  static Future<void> synthesizeToFile({
+    required String text,
+    required String path,
+    String? voice,
+  }) async {
+    try {
+      if (await NativePhononModel.isInstalled()) {
+        final native = await NativePhononNarration.voices();
+        if ((voice == null && !await MediaPipeModels.phononInstalled()) ||
+            native.contains(voice)) {
+          return await NativePhononNarration.synthesizeToFile(
+            text: text,
+            path: path,
+            voice: voice,
+          );
+        }
+      }
+      await phononSpeech.synthesizeToFile(
+        text: text,
+        path: path,
+        voice: voice ?? 'freya',
+      );
+    } catch (error) {
+      throw PhononException('Phonon could not narrate this passage: $error');
+    }
+  }
+
+  static Future<void> preview({
+    required String text,
+    required String path,
+    String? voice,
+  }) => synthesizeToFile(text: text, path: path, voice: voice);
+  static Future<void> stopPreview() async {
+    phononSpeech.cancel();
+    await NativePhononNarration.stopPreview();
+  }
+
+  static void release({Duration after = const Duration(seconds: 90)}) {
+    phononSpeech.release(after: after);
+    NativePhononNarration.release(after: after);
+  }
+
+  static Future<void> unload() async {
+    await phononSpeech.unload();
+    await NativePhononNarration.unload();
   }
 }

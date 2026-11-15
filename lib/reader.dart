@@ -1,14 +1,9 @@
 import 'dart:async';
-import 'dart:io';
 import 'dart:math' as math;
 
 import 'package:epub_rtl/epub_rtl.dart';
-import 'package:file_selector/file_selector.dart';
-import 'package:flutter/foundation.dart'
-    show TargetPlatform, defaultTargetPlatform;
 import 'package:flutter/material.dart';
 import 'package:pdfrx/pdfrx.dart';
-import 'package:shared_preferences/shared_preferences.dart';
 
 import 'character_voices.dart';
 import 'lfm3.dart';
@@ -16,9 +11,13 @@ import 'lfm3_audio.dart';
 import 'library.dart';
 import 'narration.dart';
 import 'phonon.dart';
+import 'pocket_tts.dart';
+import 'supertonic.dart';
 import 'reading_page.dart';
 import 'text_highlight.dart';
 import 'theme.dart';
+import 'reader_preferences.dart';
+import 'settings_screen.dart';
 
 class Reader extends StatefulWidget {
   const Reader({
@@ -30,6 +29,8 @@ class Reader extends StatefulWidget {
     required this.bookmark,
     this.resumeNarration = false,
     this.onClosed,
+    this.narrator,
+    this.preferences,
   });
   final OpenedBook book;
   final Library library;
@@ -38,15 +39,18 @@ class Reader extends StatefulWidget {
   final int? bookmark;
   final bool resumeNarration;
   final VoidCallback? onClosed;
+  final Narrator? narrator;
+  final ReaderPreferences? preferences;
 
   @override
   State<Reader> createState() => _ReaderState();
 }
 
 class _ReaderState extends State<Reader> {
-  final _narrator = Narrator();
+  late final _narrator = widget.narrator ?? Narrator();
   PageController? _pdfController;
-  final _prefs = SharedPreferencesAsync();
+  late final _preferences = widget.preferences ?? ReaderPreferences();
+  int _preferencesRevision = 0;
   late int _index;
   int? _bookmark;
   double _fontSize = 21;
@@ -56,32 +60,21 @@ class _ReaderState extends State<Reader> {
   bool _zoomedPdf = false;
   bool _backgroundPlayback = true;
   bool _continueToEnd = true;
-  bool _previewing = false;
   bool _scanningCast = false;
   List<SystemVoice> _systemVoices = const [];
   bool _loadingSystemVoices = false;
   bool _lfm3Enabled = false;
   bool _lfm3Ready = false;
-  bool _lfm3Downloading = false;
   bool _lfm3Analyzing = false;
   bool _lfm3Loaded = false;
   int _lfm3Received = 0;
   int _lfm3Total = Lfm3Model.expectedBytes;
-  bool _lfm3AudioReady = false;
-  bool _lfm3AudioDownloading = false;
-  int _lfm3AudioReceived = 0;
-  int _lfm3AudioTotal = Lfm3AudioModel.totalBytes;
-  bool _phononReady = false;
-  bool _phononDownloading = false;
-  bool _phononLoadingVoices = false;
-  int _phononReceived = 0;
-  int _phononTotal = PhononModel.zipBytes;
-  List<String> _phononVoices = const [];
   CharacterCast _cast = const CharacterCast();
   NarrationCheckpoint? _resume;
   final _textScroll = ScrollController();
   final _highlightedBlockKey = GlobalKey();
   String? _lastScrolledPassage;
+  bool _notifiedDefaultFallback = false;
   Timer? _narrationSaveTimer;
   late final AppLifecycleListener _lifecycle;
   Timer? _positionTimer;
@@ -101,8 +94,10 @@ class _ReaderState extends State<Reader> {
     _bookmark = widget.bookmark;
     if (_isPdf) _pdfController = PageController(initialPage: _index);
     widget.theme.addListener(_themeChanged);
+    _preferences.addListener(_preferencesChanged);
     _narrator.addListener(_narratorChanged);
     _lifecycle = AppLifecycleListener(
+      onResume: _narrator.sleepTimer.check,
       onPause: () {
         unawaited(_persistNarration());
         if (!_backgroundPlayback) unawaited(_narrator.pause());
@@ -145,7 +140,7 @@ class _ReaderState extends State<Reader> {
       _loadNarration(),
       _loadCast(),
       if (SystemVoices.supported) _loadSystemVoices(),
-      _checkLfm3(),
+      if (_lfm3Enabled) _checkLfm3(),
     ]);
     if (!mounted) return;
     if (widget.resumeNarration && _resume != null) {
@@ -182,11 +177,14 @@ class _ReaderState extends State<Reader> {
     }
   }
 
-  Future<void> _saveCast() async {
+  Future<void> _saveCast({bool apply = true}) async {
     try {
       await widget.library.saveCast(book.entry, _cast);
     } catch (_) {
       // Cast changes apply for this session even if persistence fails.
+    }
+    if (apply && mounted) {
+      await _narrator.applySettings(_narrator.settings, rebuild: true);
     }
   }
 
@@ -342,7 +340,7 @@ class _ReaderState extends State<Reader> {
     _notice(
       name == null
           ? 'The main character was cleared.'
-          : '$name is now the main character. Restart narration to apply.',
+          : '$name is now the main character. The current narration will use this cast.',
     );
   }
 
@@ -362,197 +360,6 @@ class _ReaderState extends State<Reader> {
       _lfm3Ready = ready;
       if (!ready) _lfm3Enabled = false;
     });
-  }
-
-  Future<void> _toggleLfm3(bool value, {VoidCallback? onUpdate}) async {
-    if (_lfm3Downloading || _lfm3Analyzing) return;
-    setState(() => _lfm3Enabled = value);
-    onUpdate?.call();
-    await _savePreferences();
-    if (value && !_lfm3Ready) {
-      await _downloadLfm3(onUpdate: onUpdate);
-    }
-  }
-
-  Future<void> _downloadLfm3({VoidCallback? onUpdate}) async {
-    if (_lfm3Downloading || !Lfm3Model.supported) return;
-    setState(() {
-      _lfm3Downloading = true;
-      _lfm3Received = 0;
-      _lfm3Total = 100;
-    });
-    onUpdate?.call();
-    try {
-      await Lfm3Model.download(
-        onProgress: (percent) {
-          if (!mounted) return;
-          setState(() => _lfm3Received = percent);
-          onUpdate?.call();
-        },
-      );
-      if (!mounted) return;
-      setState(() {
-        _lfm3Ready = true;
-        _lfm3Enabled = true;
-      });
-      onUpdate?.call();
-      await _savePreferences();
-      _notice('LFM3 is ready. Analyze a chapter to try it.');
-    } catch (error) {
-      if (!mounted) return;
-      setState(() {
-        _lfm3Ready = false;
-        _lfm3Enabled = false;
-      });
-      onUpdate?.call();
-      await _savePreferences();
-      _notice('The LFM3 model could not be downloaded: $error');
-    } finally {
-      if (mounted) {
-        setState(() => _lfm3Downloading = false);
-        onUpdate?.call();
-      }
-    }
-  }
-
-  Future<void> _deleteLfm3({VoidCallback? onUpdate}) async {
-    final confirmed = await showDialog<bool>(
-      context: context,
-      builder: (context) => AlertDialog(
-        title: const Text('Delete the LFM3 model?'),
-        content: const Text(
-          'This frees about 1.1 GB. You can download it again later.',
-        ),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(context, false),
-            child: const Text('Cancel'),
-          ),
-          FilledButton(
-            onPressed: () => Navigator.pop(context, true),
-            child: const Text('Delete'),
-          ),
-        ],
-      ),
-    );
-    if (confirmed != true) return;
-    try {
-      await Lfm3Model.delete();
-      if (!mounted) return;
-      setState(() {
-        _lfm3Ready = false;
-        _lfm3Enabled = false;
-        _lfm3Loaded = false;
-      });
-      onUpdate?.call();
-      await _savePreferences();
-      _notice('The LFM3 model was deleted.');
-    } catch (error) {
-      if (mounted) _notice('The LFM3 model could not be deleted: $error');
-    }
-  }
-
-  Future<void> _toggleLfm3Audio(bool value, {VoidCallback? onUpdate}) async {
-    if (_lfm3AudioDownloading) return;
-    if (value && !_lfm3AudioReady) {
-      await _downloadLfm3Audio(onUpdate: onUpdate);
-      return;
-    }
-    setState(() {
-      _narrator.settings = _narrator.settings.withChanges(lfm3Narration: value);
-    });
-    onUpdate?.call();
-    await _savePreferences();
-    if (!value && !_narrator.active) unawaited(Lfm3Audio.unload());
-  }
-
-  Future<void> _downloadLfm3Audio({VoidCallback? onUpdate}) async {
-    if (_lfm3AudioDownloading || !Lfm3AudioModel.supported) return;
-    setState(() {
-      _lfm3AudioDownloading = true;
-      _lfm3AudioReceived = 0;
-      _lfm3AudioTotal = Lfm3AudioModel.totalBytes;
-    });
-    onUpdate?.call();
-    try {
-      await Lfm3AudioModel.download(
-        onProgress: (received, total) {
-          if (!mounted) return;
-          setState(() {
-            _lfm3AudioReceived = received;
-            _lfm3AudioTotal = total;
-          });
-          onUpdate?.call();
-        },
-      );
-      if (!mounted) return;
-      setState(() {
-        _lfm3AudioReady = true;
-        _narrator.settings = _narrator.settings.withChanges(
-          lfm3Narration: true,
-        );
-      });
-      onUpdate?.call();
-      await _savePreferences();
-      _notice('LFM3-Audio narration is ready. Start Read aloud to try it.');
-    } catch (error) {
-      if (!mounted) return;
-      setState(() {
-        _lfm3AudioReady = false;
-        _narrator.settings = _narrator.settings.withChanges(
-          lfm3Narration: false,
-        );
-      });
-      onUpdate?.call();
-      await _savePreferences();
-      _notice('The LFM3-Audio model could not be downloaded: $error');
-    } finally {
-      if (mounted) {
-        setState(() => _lfm3AudioDownloading = false);
-        onUpdate?.call();
-      }
-    }
-  }
-
-  Future<void> _deleteLfm3Audio({VoidCallback? onUpdate}) async {
-    final confirmed = await showDialog<bool>(
-      context: context,
-      builder: (context) => AlertDialog(
-        title: const Text('Delete the LFM3-Audio model?'),
-        content: const Text(
-          'This frees about 1.3 GB. Narration returns to Kokoro or your '
-          'iPhone voices, and you can download the model again later.',
-        ),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(context, false),
-            child: const Text('Cancel'),
-          ),
-          FilledButton(
-            onPressed: () => Navigator.pop(context, true),
-            child: const Text('Delete'),
-          ),
-        ],
-      ),
-    );
-    if (confirmed != true) return;
-    try {
-      await Lfm3AudioModel.delete();
-      if (!mounted) return;
-      setState(() {
-        _lfm3AudioReady = false;
-        _narrator.settings = _narrator.settings.withChanges(
-          lfm3Narration: false,
-        );
-      });
-      onUpdate?.call();
-      await _savePreferences();
-      _notice('The LFM3-Audio model was deleted.');
-    } catch (error) {
-      if (mounted) {
-        _notice('The LFM3-Audio model could not be deleted: $error');
-      }
-    }
   }
 
   Future<void> _analyzeWithLfm3() async {
@@ -897,9 +704,10 @@ class _ReaderState extends State<Reader> {
         if (selected.engine == VoiceEngine.system &&
             !voices.any((voice) => voice.identifier == selected.systemVoice) &&
             voices.isNotEmpty) {
-          _narrator.settings = selected.withChanges(
+          _preferences.voice = selected.withChanges(
             systemVoice: voices.first.identifier,
           );
+          unawaited(_preferences.save());
         }
       });
     } finally {
@@ -907,218 +715,104 @@ class _ReaderState extends State<Reader> {
     }
   }
 
-  Future<void> _loadPhononVoices() async {
-    if (_phononLoadingVoices || !PhononNarration.supported) return;
-    setState(() => _phononLoadingVoices = true);
-    try {
-      final values = await PhononNarration.voices(refresh: true);
-      if (!mounted) return;
-      setState(() {
-        _phononVoices = values;
-        final selected = _narrator.settings;
-        if (selected.engine == VoiceEngine.phonon &&
-            values.isNotEmpty &&
-            !values.contains(selected.phononVoice)) {
-          _narrator.settings = selected.withChanges(phononVoice: values.first);
-        }
-      });
-    } on PhononException catch (error) {
-      if (mounted) _notice(error.message);
-    } catch (_) {
-      if (mounted) _notice('The Phonon voices could not be loaded.');
-    } finally {
-      if (mounted) setState(() => _phononLoadingVoices = false);
-    }
-  }
-
-  Future<void> _downloadPhonon({VoidCallback? onUpdate}) async {
-    if (_phononDownloading) return;
-    setState(() {
-      _phononDownloading = true;
-      _phononReceived = 0;
-      _phononTotal = PhononModel.zipBytes;
-    });
-    onUpdate?.call();
-    try {
-      await PhononModel.download(
-        onProgress: (received, total) {
-          if (!mounted) return;
-          setState(() {
-            _phononReceived = received;
-            _phononTotal = total;
-          });
-          onUpdate?.call();
-        },
-      );
-      if (!mounted) return;
-      setState(() {
-        _phononReady = true;
-        _phononDownloading = false;
-      });
-      await _loadPhononVoices();
-      if (mounted) {
-        _notice('Phonon is ready. The experimental narrator is available.');
-      }
-    } on PhononException catch (error) {
-      if (mounted) _notice(error.message);
-    } catch (_) {
-      if (mounted) _notice('The Phonon model could not be downloaded.');
-    } finally {
-      if (mounted) {
-        setState(() => _phononDownloading = false);
-        onUpdate?.call();
-      }
-    }
-  }
-
-  Future<void> _importPhononVoice({VoidCallback? onUpdate}) async {
-    try {
-      const type = XTypeGroup(
-        label: 'Phonon voice',
-        extensions: ['safetensors'],
-      );
-      final file = await openFile(acceptedTypeGroups: [type]);
-      if (file == null) return;
-      final name = await PhononModel.importVoice(File(file.path));
-      await _loadPhononVoices();
-      if (mounted) {
-        _notice('Imported $name. The voice works offline.');
-      }
-    } on PhononException catch (error) {
-      if (mounted) _notice(error.message);
-    } catch (_) {
-      if (mounted) _notice('The Phonon voice could not be imported.');
-    } finally {
-      onUpdate?.call();
-    }
-  }
-
-  Future<void> _deletePhonon({VoidCallback? onUpdate}) async {
-    try {
-      await PhononModel.delete();
-      if (!mounted) return;
-      setState(() {
-        _phononReady = false;
-        _phononVoices = const [];
-        _phononReceived = 0;
-      });
-      if (_narrator.settings.engine == VoiceEngine.phonon) {
-        _narrator.settings = _narrator.settings.withChanges(
-          engine: VoiceEngine.kokoro,
-        );
-        await _savePreferences();
-      }
-      if (mounted) _notice('The Phonon model was deleted. Kokoro is active.');
-    } on PhononException catch (error) {
-      if (mounted) _notice(error.message);
-    } finally {
-      onUpdate?.call();
-    }
-  }
+  void _preferencesChanged() => unawaited(
+    _applyPreferences().catchError((Object _) {
+      if (mounted) _notice('Some settings could not be applied.');
+    }),
+  );
 
   Future<void> _loadPreferences() async {
     try {
-      final darkPdf = await _prefs.getBool('reader.darkPdf');
-      final font = await _prefs.getDouble('reader.font');
-      final leading = await _prefs.getDouble('reader.leading');
-      final voice =
-          await _prefs.getInt('reader.voice.v1') ??
-          upgradedVoice(await _prefs.getInt('reader.voice'));
-      final engine = await _prefs.getString('reader.engine');
-      final systemVoice = await _prefs.getString('reader.systemVoice');
-      final background = await _prefs.getBool('reader.backgroundAudio');
-      final continueToEnd = await _prefs.getBool('reader.continueToEnd');
-      final speed = await _prefs.getDouble('reader.speed');
-      final pauses = await _prefs.getDouble('reader.pauses');
-      final pitch = await _prefs.getDouble('reader.pitch');
-      final volume = await _prefs.getDouble('reader.volume');
-      final marks = await _prefs.getBool('reader.marks');
-      final characterVoices = await _prefs.getBool('reader.characterVoices');
-      final batterySaver = await _prefs.getBool('reader.batterySaver');
-      final lfm3 = await _prefs.getBool('reader.lfm3');
-      final lfm3Audio = await _prefs.getBool('reader.lfm3Audio');
-      final lfm3AudioVoice = await _prefs.getString('reader.lfm3AudioVoice');
-      final lfm3AudioReady = await Lfm3AudioModel.isInstalled();
-      final phononVoice = await _prefs.getString('reader.phononVoice');
-      final phononReady =
-          PhononNarration.supported && await PhononModel.isInstalled();
-      if (!mounted) return;
-      setState(() {
-        _darkPdfPages = darkPdf ?? true;
-        _backgroundPlayback = background ?? true;
-        _continueToEnd = continueToEnd ?? true;
-        _lfm3Enabled = lfm3 ?? false;
-        _lfm3AudioReady = lfm3AudioReady;
-        _phononReady = phononReady;
-        _fontSize = (font ?? 21).clamp(15, 34);
-        _lineHeight = (leading ?? 1.65).clamp(1.25, 2);
-        _narrator.settings = VoiceSettings(
-          engine: switch (engine) {
-            'system' when SystemVoices.supported => VoiceEngine.system,
-            'phonon' when phononReady => VoiceEngine.phonon,
-            _ => VoiceEngine.kokoro,
-          },
-          voice: voices.containsKey(voice) ? voice : defaultVoice,
-          systemVoice: systemVoice,
-          speed: (speed ?? 1).clamp(.6, 1.8),
-          pauses: (pauses ?? 1).clamp(.05, 1),
-          pitch: (pitch ?? 1).clamp(.75, 1.35),
-          volume: (volume ?? 1).clamp(0, 1),
-          punctuation: marks == true
-              ? Punctuation.announce
-              : Punctuation.natural,
-          characterVoices: characterVoices ?? true,
-          batterySaver:
-              batterySaver ??
-              (defaultTargetPlatform == TargetPlatform.iOS ||
-                  defaultTargetPlatform == TargetPlatform.android),
-          lfm3Narration: (lfm3Audio ?? false) && lfm3AudioReady,
-          lfm3Voice:
-              lfm3AudioVoice != null &&
-                  Lfm3Audio.voices.contains(lfm3AudioVoice)
-              ? lfm3AudioVoice
-              : 'female',
-          phononVoice: (phononVoice ?? '').trim().isEmpty
-              ? 'Harper'
-              : phononVoice!.trim(),
-        );
-      });
+      await _preferences.load();
+      await _applyPreferences();
     } catch (_) {
       if (mounted) _notice('Saved reader settings could not be loaded.');
     }
   }
 
-  Future<void> _savePreferences() async {
-    final settings = _narrator.settings;
-    try {
-      await Future.wait([
-        _prefs.setBool('reader.darkPdf', _darkPdfPages),
-        _prefs.setDouble('reader.font', _fontSize),
-        _prefs.setDouble('reader.leading', _lineHeight),
-        _prefs.setString('reader.engine', settings.engine.name),
-        _prefs.setInt('reader.voice.v1', settings.voice),
-        if (settings.systemVoice case final voice?)
-          _prefs.setString('reader.systemVoice', voice),
-        _prefs.setBool('reader.backgroundAudio', _backgroundPlayback),
-        _prefs.setBool('reader.continueToEnd', _continueToEnd),
-        _prefs.setDouble('reader.speed', settings.speed),
-        _prefs.setDouble('reader.pauses', settings.pauses),
-        _prefs.setDouble('reader.pitch', settings.pitch),
-        _prefs.setDouble('reader.volume', settings.volume),
-        _prefs.setBool(
-          'reader.marks',
-          settings.punctuation == Punctuation.announce,
-        ),
-        _prefs.setBool('reader.characterVoices', settings.characterVoices),
-        _prefs.setBool('reader.batterySaver', settings.batterySaver),
-        _prefs.setBool('reader.lfm3', _lfm3Enabled),
-        _prefs.setBool('reader.lfm3Audio', settings.lfm3Narration),
-        _prefs.setString('reader.lfm3AudioVoice', settings.lfm3Voice),
-        _prefs.setString('reader.phononVoice', settings.phononVoice),
-      ]);
-    } catch (_) {
-      if (mounted) _notice('Reader settings could not be saved.');
+  Future<void> _applyPreferences() async {
+    final revision = ++_preferencesRevision;
+    final selected = _preferences.voice;
+    if (mounted) {
+      setState(() {
+        _fontSize = _preferences.fontSize;
+        _lineHeight = _preferences.lineHeight;
+        _darkPdfPages = _preferences.darkPdfPages;
+        _backgroundPlayback = _preferences.backgroundPlayback;
+        _continueToEnd = _preferences.continueToEnd;
+        _lfm3Enabled = _preferences.lfm3Enabled;
+      });
     }
+    final phononReady =
+        selected.engine != VoiceEngine.phonon ||
+        _narrator.settings.engine == VoiceEngine.phonon ||
+        await PhononModel.isInstalled();
+    final audioReady =
+        !selected.lfm3Narration ||
+        _narrator.settings.lfm3Narration ||
+        await Lfm3AudioModel.isInstalled();
+    final pocketReady =
+        selected.engine != VoiceEngine.pocket ||
+        _narrator.settings.engine == VoiceEngine.pocket ||
+        await PocketTts.isInstalled();
+    final supertonicReady =
+        selected.engine != VoiceEngine.supertonic ||
+        _narrator.settings.engine == VoiceEngine.supertonic ||
+        await SupertonicModel.isInstalled();
+    var phononVoice = selected.phononVoice;
+    if (selected.engine == VoiceEngine.phonon &&
+        phononReady &&
+        (_narrator.settings.engine != VoiceEngine.phonon ||
+            _narrator.settings.phononVoice != phononVoice)) {
+      final available = await PhononNarration.voices();
+      if (available.isNotEmpty && !available.contains(phononVoice)) {
+        phononVoice = available.first;
+      }
+    }
+    if (!mounted || revision != _preferencesRevision) return;
+    final effective = selected.withChanges(
+      phononVoice: phononVoice,
+      engine:
+          (!phononReady ||
+              !pocketReady ||
+              !supertonicReady ||
+              selected.engine == VoiceEngine.system && !SystemVoices.supported)
+          ? VoiceEngine.kokoro
+          : selected.engine,
+      lfm3Narration:
+          selected.lfm3Narration &&
+          audioReady &&
+          selected.engine != VoiceEngine.pocket &&
+          selected.engine != VoiceEngine.supertonic,
+    );
+    await _narrator.applySettings(effective, continueToEnd: _continueToEnd);
+    if (effective.engine == VoiceEngine.supertonic &&
+        !_narrator.active &&
+        !_narrator.navigating) {
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (mounted) {
+          unawaited(
+            _narrator.prepareSelectedVoice().catchError((Object _) {
+              // Reading stays available. Play reports any model failure normally.
+            }),
+          );
+        }
+      });
+      WidgetsBinding.instance.ensureVisualUpdate();
+    }
+  }
+
+  Future<void> _openSettings() async {
+    await Navigator.of(context).push(
+      MaterialPageRoute<void>(
+        builder: (_) => SettingsScreen(
+          preferences: _preferences,
+          theme: widget.theme,
+          narrator: _narrator,
+          aiBusy: _lfm3Analyzing,
+        ),
+      ),
+    );
   }
 
   void _notice(String message) {
@@ -1218,992 +912,215 @@ class _ReaderState extends State<Reader> {
     if (mounted && next != null) await _jump(next);
   }
 
-  Future<void> _settings({required bool voice}) async {
+  Future<void> _bookSettings() async {
+    if (_lfm3Enabled) await _checkLfm3();
+    if (!mounted) return;
     await showModalBottomSheet<void>(
       context: context,
       isScrollControlled: true,
       backgroundColor: Colors.transparent,
-      builder: (context) => StatefulBuilder(
+      builder: (_) => StatefulBuilder(
         builder: (context, refresh) {
           final settings = _narrator.settings;
-          final system = settings.engine == VoiceEngine.system;
-          final phonon = settings.engine == VoiceEngine.phonon;
-          final engines = [
-            VoiceEngine.kokoro,
-            if (SystemVoices.supported) VoiceEngine.system,
-            if (PhononNarration.supported) VoiceEngine.phonon,
-          ];
           void refreshSheet() {
-            try {
-              refresh(() {});
-            } catch (_) {
-              // The settings sheet can close while a download is running.
-            }
+            if (context.mounted) refresh(() {});
           }
 
           void update(VoidCallback apply) {
             setState(apply);
-            refresh(() {});
+            refreshSheet();
           }
 
           return _sheet(
             FractionallySizedBox(
               heightFactor: .9,
               child: SingleChildScrollView(
-                padding: const EdgeInsets.fromLTRB(24, 24, 24, 24),
+                padding: const EdgeInsets.all(24),
                 child: Column(
                   crossAxisAlignment: CrossAxisAlignment.stretch,
                   children: [
                     Text(
-                      voice ? 'Read aloud settings' : 'Reading appearance',
-                      style: _paper.theme.textTheme.headlineSmall?.copyWith(
-                        color: _paper.ink,
-                      ),
+                      'Book settings',
+                      style: Theme.of(context).textTheme.headlineSmall,
                     ),
-                    const SizedBox(height: 16),
-                    if (voice) ...[
+                    Text(
+                      book.entry.title,
+                      style: Theme.of(context).textTheme.titleMedium,
+                    ),
+                    const SizedBox(height: 12),
+                    const Text(
+                      'Cast and speaker corrections apply only to this book.',
+                    ),
+                    if (!settings.characterVoices)
                       const Text(
-                        'Changes apply the next time you start Read aloud. '
-                        'Kokoro remains the default. System uses voices '
-                        'installed on your iPhone; Phonon is an experimental '
-                        'on-device English model.',
+                        'Character voices are off. Enable them in Settings to hear this cast.',
                       ),
-                      if (engines.length > 1) ...[
-                        const SizedBox(height: 16),
-                        SegmentedButton<VoiceEngine>(
-                          segments: [
-                            for (final engine in engines)
-                              ButtonSegment(
-                                value: engine,
-                                label: Text(engine.label),
-                              ),
-                          ],
-                          selected: {settings.engine},
-                          onSelectionChanged: (values) {
-                            final engine = values.first;
-                            final savedVoice = settings.systemVoice;
-                            final savedIsValid = _systemVoices.any(
-                              (voice) => voice.identifier == savedVoice,
-                            );
-                            update(() {
-                              _narrator.settings = settings.withChanges(
-                                engine: engine,
-                                systemVoice:
-                                    engine == VoiceEngine.system &&
-                                        _systemVoices.isNotEmpty &&
-                                        !savedIsValid
-                                    ? _systemVoices.first.identifier
-                                    : savedVoice,
-                                lfm3Narration: engine == VoiceEngine.phonon
-                                    ? false
-                                    : settings.lfm3Narration,
-                              );
-                            });
-                            if (engine == VoiceEngine.system &&
-                                _systemVoices.isEmpty) {
-                              unawaited(_loadSystemVoices());
-                            }
-                            if (engine == VoiceEngine.phonon &&
-                                _phononReady &&
-                                _phononVoices.isEmpty) {
-                              unawaited(_loadPhononVoices());
-                            }
-                          },
-                        ),
-                        Padding(
-                          padding: const EdgeInsets.only(top: 6),
+                    const SizedBox(height: 12),
+
+                    Row(
+                      children: [
+                        Expanded(
                           child: Text(
-                            settings.engine.description,
-                            style: Theme.of(context).textTheme.bodySmall,
+                            'Cast',
+                            style: Theme.of(context).textTheme.titleSmall,
                           ),
                         ),
-                      ],
-                      const SizedBox(height: 16),
-                      Wrap(
-                        spacing: 8,
-                        runSpacing: 8,
-                        children: [
-                          for (final preset in voicePresets.entries)
-                            ActionChip(
-                              label: Text(preset.key),
-                              onPressed: () => update(() {
-                                _narrator.settings = settings.withChanges(
-                                  voice: settings.engine == VoiceEngine.kokoro
-                                      ? preset.value.voice
-                                      : settings.voice,
-                                  speed: preset.value.speed,
-                                  pauses: preset.value.pauses,
-                                  punctuation: preset.value.punctuation,
-                                );
-                              }),
-                            ),
-                        ],
-                      ),
-                      const SizedBox(height: 16),
-                      if (system) ...[
-                        if (_loadingSystemVoices)
-                          const Padding(
-                            padding: EdgeInsets.symmetric(vertical: 12),
-                            child: LinearProgressIndicator(),
-                          )
-                        else if (_systemVoices.isEmpty)
-                          _VoiceNotice(
-                            message:
-                                'No iPhone voices were found. Download a voice '
-                                'in Settings › Accessibility › Spoken Content › '
-                                'Voices, then reopen this sheet.',
-                            action: 'Refresh',
-                            onAction: () => unawaited(_loadSystemVoices()),
-                          )
-                        else
-                          DropdownButtonFormField<String>(
-                            key: ValueKey(
-                              'system-${settings.systemVoice}-'
-                              '${_systemVoices.length}',
-                            ),
-                            decoration: const InputDecoration(
-                              labelText: 'iPhone voice',
-                              border: OutlineInputBorder(),
-                            ),
-                            initialValue:
-                                _systemVoices.any(
-                                  (voice) =>
-                                      voice.identifier == settings.systemVoice,
-                                )
-                                ? settings.systemVoice
-                                : _systemVoices.first.identifier,
-                            isExpanded: true,
-                            items: [
-                              for (final voice in _systemVoices)
-                                DropdownMenuItem(
-                                  value: voice.identifier,
-                                  child: Text(
-                                    voice.label,
-                                    maxLines: 1,
-                                    overflow: TextOverflow.ellipsis,
-                                  ),
-                                ),
-                            ],
-                            onChanged: (value) => update(
-                              () => _narrator.settings = settings.withChanges(
-                                systemVoice: value,
-                              ),
-                            ),
-                          ),
-                        if (_systemVoices.isNotEmpty)
-                          Padding(
-                            padding: const EdgeInsets.only(top: 8),
-                            child: _VoiceNotice(
-                              message:
-                                  'For more natural voices, download enhanced '
-                                  'or premium voices in Settings › '
-                                  'Accessibility › Spoken Content › Voices.',
-                              action: 'Refresh',
-                              onAction: () => unawaited(_loadSystemVoices()),
-                            ),
-                          ),
-                      ] else if (phonon) ...[
-                        const Align(
-                          alignment: Alignment.centerLeft,
-                          child: Text(
-                            'Experimental · Phonon narrator',
-                            style: TextStyle(fontWeight: FontWeight.w600),
-                          ),
-                        ),
-                        const SizedBox(height: 6),
-                        Text(
-                          'A ${PhononModel.displaySize} on-device English '
-                          'model by Gradium. It runs on the Apple Neural '
-                          'Engine and works offline after the one-time '
-                          'download. License: ${PhononModel.license}.',
-                          style: Theme.of(context).textTheme.bodySmall,
-                        ),
-                        if (_phononDownloading) ...[
-                          const SizedBox(height: 10),
-                          LinearProgressIndicator(
-                            value: _phononTotal > 0
-                                ? (_phononReceived / _phononTotal).clamp(
-                                    0.0,
-                                    1.0,
-                                  )
-                                : null,
-                          ),
-                          const SizedBox(height: 6),
-                          Text(
-                            '${(_phononReceived / _phononTotal * 100).clamp(0, 100).round()}% '
-                            'of ${PhononModel.displaySize}',
-                            style: Theme.of(context).textTheme.bodySmall,
-                          ),
-                        ] else if (!_phononReady) ...[
-                          const SizedBox(height: 8),
-                          _VoiceNotice(
-                            message:
-                                'Phonon is downloaded only when you choose '
-                                'it. Installed size is '
-                                '${PhononModel.installedSize}.',
-                            action: 'Download',
-                            onAction: () => unawaited(
-                              _downloadPhonon(onUpdate: refreshSheet),
-                            ),
-                          ),
-                        ] else ...[
-                          const SizedBox(height: 8),
-                          if (_phononLoadingVoices)
-                            const LinearProgressIndicator()
-                          else if (_phononVoices.isEmpty) ...[
-                            _VoiceNotice(
-                              message:
-                                  'Phonon is installed. Load its voices to '
-                                  'choose a narrator.',
-                              action: 'Load voices',
-                              onAction: () => unawaited(_loadPhononVoices()),
-                            ),
-                            Align(
-                              alignment: Alignment.centerLeft,
-                              child: TextButton.icon(
-                                onPressed: _narrator.active
-                                    ? null
-                                    : () => unawaited(
-                                        _deletePhonon(onUpdate: refreshSheet),
-                                      ),
-                                icon: const Icon(
-                                  Icons.delete_outline,
-                                  size: 18,
-                                ),
-                                label: const Text('Delete Phonon model'),
-                              ),
-                            ),
-                          ] else
-                            DropdownButtonFormField<String>(
-                              key: ValueKey(
-                                'phonon-${settings.phononVoice}-'
-                                '${_phononVoices.length}',
-                              ),
-                              decoration: const InputDecoration(
-                                labelText: 'Phonon voice',
-                                border: OutlineInputBorder(),
-                              ),
-                              initialValue:
-                                  _phononVoices.contains(settings.phononVoice)
-                                  ? settings.phononVoice
-                                  : _phononVoices.first,
-                              isExpanded: true,
-                              items: [
-                                for (final voice in _phononVoices)
-                                  DropdownMenuItem(
-                                    value: voice,
-                                    child: Text(voice),
-                                  ),
-                              ],
-                              onChanged: (value) => update(() {
-                                _narrator.settings = settings.withChanges(
-                                  phononVoice: value,
-                                );
-                                unawaited(_savePreferences());
-                              }),
-                            ),
-                          const SizedBox(height: 6),
-                          Text(
-                            'Phonon reads the whole book in one voice. '
-                            'Character voices and LFM3-Audio are not used '
-                            'while it is selected. To use a cloned voice, '
-                            'create it in Gradium Studio, download the '
-                            '.safetensors file, and import it here.',
-                            style: Theme.of(context).textTheme.bodySmall,
-                          ),
-                          Wrap(
-                            spacing: 8,
-                            children: [
-                              TextButton.icon(
-                                onPressed:
-                                    _phononDownloading || _narrator.active
-                                    ? null
-                                    : () => unawaited(
-                                        _importPhononVoice(
-                                          onUpdate: refreshSheet,
-                                        ),
-                                      ),
-                                icon: const Icon(
-                                  Icons.library_add_outlined,
-                                  size: 18,
-                                ),
-                                label: const Text('Import cloned voice'),
-                              ),
-                              TextButton.icon(
-                                onPressed:
-                                    _phononDownloading || _narrator.active
-                                    ? null
-                                    : () => unawaited(
-                                        _deletePhonon(onUpdate: refreshSheet),
-                                      ),
-                                icon: const Icon(
-                                  Icons.delete_outline,
-                                  size: 18,
-                                ),
-                                label: const Text('Delete Phonon model'),
-                              ),
-                            ],
-                          ),
-                        ],
-                      ] else
-                        DropdownButtonFormField<int>(
-                          key: ValueKey('kokoro-${settings.voice}'),
-                          decoration: const InputDecoration(
-                            labelText: 'Kokoro voice',
-                            border: OutlineInputBorder(),
-                          ),
-                          initialValue: settings.voice,
-                          isExpanded: true,
-                          items: [
-                            for (final item in voices.entries)
-                              DropdownMenuItem(
-                                value: item.key,
-                                child: Text(item.value),
-                              ),
-                          ],
-                          onChanged: (value) => update(
-                            () => _narrator.settings = settings.withChanges(
-                              voice: value,
-                            ),
-                          ),
-                        ),
-                      const SizedBox(height: 12),
-                      Align(
-                        alignment: Alignment.centerLeft,
-                        child: OutlinedButton.icon(
-                          onPressed: _narrator.active || _previewing
+                        TextButton.icon(
+                          onPressed: _scanningCast
                               ? null
                               : () async {
-                                  final preview = _previewVoice(settings);
+                                  final scan = _scanCharacters();
                                   refreshSheet();
-                                  await preview;
+                                  await scan;
                                   refreshSheet();
                                 },
-                          icon: _previewing
+                          icon: _scanningCast
                               ? const SizedBox.square(
-                                  dimension: 18,
+                                  dimension: 16,
                                   child: CircularProgressIndicator(
                                     strokeWidth: 2,
                                   ),
                                 )
-                              : const Icon(Icons.play_circle_outline),
+                              : const Icon(Icons.person_search_outlined),
                           label: Text(
-                            _previewing ? 'Playing preview' : 'Preview voice',
+                            _scanningCast ? 'Finding…' : 'Find characters',
                           ),
                         ),
-                      ),
-                      const SizedBox(height: 8),
-                      SwitchListTile(
-                        contentPadding: EdgeInsets.zero,
-                        title: const Text('Character voices'),
-                        subtitle: const Text(
-                          'Use a different voice for quoted dialogue. '
-                          'Detection runs offline; you can change the cast here.',
-                        ),
-                        value: settings.characterVoices,
-                        onChanged: (value) => update(() {
-                          _narrator.settings = settings.withChanges(
-                            characterVoices: value,
-                          );
-                        }),
-                      ),
-                      if (settings.characterVoices) ...[
+                      ],
+                    ),
+                    if (_cast.voices.isEmpty)
+                      const Text(
+                        'Tap Find characters in a chapter with dialogue. '
+                        'Each detected name gets its own voice automatically.',
+                      )
+                    else ...[
+                      if (_cast.lead case final lead?) ...[
                         Row(
                           children: [
+                            const Icon(Icons.lock_outline, size: 16),
+                            const SizedBox(width: 6),
                             Expanded(
                               child: Text(
-                                'Cast',
-                                style: Theme.of(context).textTheme.titleSmall,
+                                'Main character',
+                                style: Theme.of(context).textTheme.labelLarge,
                               ),
                             ),
-                            TextButton.icon(
-                              onPressed: _scanningCast
-                                  ? null
-                                  : () async {
-                                      final scan = _scanCharacters();
-                                      refreshSheet();
-                                      await scan;
-                                      refreshSheet();
-                                    },
-                              icon: _scanningCast
-                                  ? const SizedBox.square(
-                                      dimension: 16,
-                                      child: CircularProgressIndicator(
-                                        strokeWidth: 2,
-                                      ),
-                                    )
-                                  : const Icon(Icons.person_search_outlined),
-                              label: Text(
-                                _scanningCast ? 'Finding…' : 'Find characters',
-                              ),
+                            TextButton(
+                              onPressed: () => unawaited(_pickLead()),
+                              child: const Text('Change'),
                             ),
                           ],
                         ),
-                        if (_cast.voices.isEmpty)
-                          const Text(
-                            'Tap Find characters in a chapter with dialogue. '
-                            'Each detected name gets its own voice automatically.',
-                          )
-                        else ...[
-                          if (_cast.lead case final lead?) ...[
-                            Row(
-                              children: [
-                                const Icon(Icons.lock_outline, size: 16),
-                                const SizedBox(width: 6),
-                                Expanded(
-                                  child: Text(
-                                    'Main character',
-                                    style: Theme.of(context)
-                                        .textTheme
-                                        .labelLarge,
-                                  ),
-                                ),
-                                TextButton(
-                                  onPressed: () => unawaited(_pickLead()),
-                                  child: const Text('Change'),
-                                ),
-                              ],
-                            ),
-                            _CastVoiceTile(
-                              character: lead,
-                              voice: _cast.voiceFor(lead) ?? const CastVoice(),
-                              settings: settings,
-                              systemVoices: _systemVoices,
-                              isLead: true,
-                              onChanged: (voice) => update(() {
-                                _cast = _cast.withVoice(lead, voice);
-                                unawaited(_saveCast());
-                              }),
-                              onRemove: null,
-                            ),
-                            const SizedBox(height: 8),
-                            Text(
-                              'Side characters',
-                              style: Theme.of(context).textTheme.labelLarge,
-                            ),
-                          ] else
-                            _VoiceNotice(
-                              message:
-                                  'No main character is pinned yet. Choose one '
-                                  'so their voice can never be taken by the '
-                                  'automatic cast.',
-                              action: 'Choose',
-                              onAction: () => unawaited(_pickLead()),
-                            ),
-                          for (final entry in _cast.voices.entries)
-                            if (entry.key != _cast.lead)
-                              _CastVoiceTile(
-                                character: entry.key,
-                                voice: entry.value,
-                                settings: settings,
-                                systemVoices: _systemVoices,
-                                leadVoice: _cast.voiceFor(_cast.lead ?? ''),
-                                onChanged: (voice) => update(() {
-                                  _cast = _cast.withVoice(entry.key, voice);
-                                  unawaited(_saveCast());
-                                }),
-                                onRemove: () => update(() {
-                                  _cast = _cast.withoutVoice(entry.key);
-                                  unawaited(_saveCast());
-                                }),
-                                onMakeLead: () =>
-                                    unawaited(_setLead(entry.key)),
-                                onMergeIntoLead: _cast.lead == null
-                                    ? null
-                                    : () =>
-                                          unawaited(_mergeIntoLead(entry.key)),
-                              ),
-                          const SizedBox(height: 4),
-                          const Text(
-                            'The main character always keeps their reserved '
-                            'voice. Side characters get a different voice. '
-                            'Detection is approximate, so review anything that '
-                            'sounds wrong.',
-                          ),
-                        ],
-                        const SizedBox(height: 4),
-                        Align(
-                          alignment: Alignment.centerLeft,
-                          child: TextButton.icon(
-                            onPressed: () => unawaited(_reviewSpeakers()),
-                            icon: const Icon(Icons.record_voice_over_outlined),
-                            label: const Text(
-                              'Review speakers in this chapter',
-                            ),
-                          ),
+                        _CastVoiceTile(
+                          character: lead,
+                          voice: _cast.voiceFor(lead) ?? const CastVoice(),
+                          settings: settings,
+                          systemVoices: _systemVoices,
+                          isLead: true,
+                          onChanged: (voice) => update(() {
+                            _cast = _cast.withVoice(lead, voice);
+                            unawaited(_saveCast());
+                          }),
+                          onRemove: null,
                         ),
-                        const SizedBox(height: 12),
-                        const Divider(),
-                      ],
-                      if (Lfm3Model.supported) ...[
-                        Container(
-                          padding: const EdgeInsets.fromLTRB(14, 12, 14, 10),
-                          decoration: BoxDecoration(
-                            color: Theme.of(context)
-                                .colorScheme
-                                .surfaceContainerHighest,
-                            borderRadius: BorderRadius.circular(16),
-                          ),
-                          child: Column(
-                            crossAxisAlignment: CrossAxisAlignment.start,
-                            children: [
-                              Row(
-                                children: [
-                                  const Icon(Icons.science_outlined, size: 18),
-                                  const SizedBox(width: 8),
-                                  Expanded(
-                                    child: Text(
-                                      'Experimental · LFM3 speakers',
-                                      style: Theme.of(context)
-                                          .textTheme
-                                          .titleSmall,
-                                    ),
-                                  ),
-                                ],
-                              ),
-                              const SizedBox(height: 6),
-                              Text(
-                                'Optional ${Lfm3Model.displaySize} on-device '
-                                'LFM3 model by Liquid AI. It downloads only '
-                                'after you turn this on. It can be slow and '
-                                'inaccurate; suggestions are cached and always '
-                                'editable.',
-                                style: Theme.of(context).textTheme.bodySmall,
-                              ),
-                              const SizedBox(height: 2),
-                              Text(
-                                'Model license: LFM Open License v1.0.',
-                                style: Theme.of(context).textTheme.bodySmall,
-                              ),
-                              Material(
-                                type: MaterialType.transparency,
-                                child: SwitchListTile(
-                                  contentPadding: EdgeInsets.zero,
-                                  title: const Text('Use LFM3 suggestions'),
-                                  subtitle: Text(
-                                    _lfm3Downloading
-                                        ? 'Downloading the model…'
-                                        : _lfm3Ready
-                                        ? 'Model ready on this device'
-                                        : 'Model not downloaded',
-                                  ),
-                                  value: _lfm3Enabled,
-                                  onChanged: _lfm3Downloading || _lfm3Analyzing
-                                      ? null
-                                      : (value) => unawaited(
-                                          _toggleLfm3(
-                                            value,
-                                            onUpdate: refreshSheet,
-                                          ),
-                                        ),
-                                ),
-                              ),
-                              if (_lfm3Downloading) ...[
-                                const SizedBox(height: 4),
-                                LinearProgressIndicator(
-                                  value: _lfm3Total > 0
-                                      ? (_lfm3Received / _lfm3Total).clamp(
-                                          0.0,
-                                          1.0,
-                                        )
-                                      : null,
-                                ),
-                                const SizedBox(height: 6),
-                                Text(
-                                  '$_lfm3Received% of '
-                                  '${Lfm3Model.displaySize}',
-                                  style: Theme.of(context).textTheme.bodySmall,
-                                ),
-                              ],
-                              if (_lfm3Ready) ...[
-                                const SizedBox(height: 6),
-                                Row(
-                                  children: [
-                                    Expanded(
-                                      child: FilledButton.tonalIcon(
-                                        onPressed: _lfm3Analyzing
-                                            ? null
-                                            : () =>
-                                                  unawaited(_analyzeWithLfm3()),
-                                        icon: _lfm3Analyzing
-                                            ? const SizedBox.square(
-                                                dimension: 16,
-                                                child:
-                                                    CircularProgressIndicator(
-                                                      strokeWidth: 2,
-                                                    ),
-                                              )
-                                            : const Icon(
-                                                Icons.auto_awesome_outlined,
-                                                size: 18,
-                                              ),
-                                        label: Text(
-                                          _lfm3Analyzing
-                                              ? 'Analyzing…'
-                                              : 'Analyze this chapter',
-                                        ),
-                                      ),
-                                    ),
-                                    IconButton(
-                                      tooltip: 'Delete LFM3 model',
-                                      onPressed: _lfm3Analyzing
-                                          ? null
-                                          : () => unawaited(
-                                              _deleteLfm3(
-                                                onUpdate: refreshSheet,
-                                              ),
-                                            ),
-                                      icon: const Icon(
-                                        Icons.delete_outline,
-                                        size: 20,
-                                      ),
-                                    ),
-                                  ],
-                                ),
-                                if (_lfm3Analyzing)
-                                  Padding(
-                                    padding: const EdgeInsets.only(top: 6),
-                                    child: Text(
-                                      _lfm3Total > 0
-                                          ? 'Part ${_lfm3Received + 1} of '
-                                                '$_lfm3Total'
-                                          : 'Loading the model…',
-                                      style: Theme.of(context)
-                                          .textTheme
-                                          .bodySmall,
-                                    ),
-                                  ),
-                                const SizedBox(height: 4),
-                                Text(
-                                  'After analysis, use Review speakers to '
-                                  'correct the suggestions. Manual edits are '
-                                  'never replaced.',
-                                  style: Theme.of(context).textTheme.bodySmall,
-                                ),
-                              ] else if (!_lfm3Downloading)
-                                Padding(
-                                  padding: const EdgeInsets.only(top: 4),
-                                  child: Text(
-                                    'Turning this on starts the model '
-                                    'download.',
-                                    style: Theme.of(context)
-                                        .textTheme
-                                        .bodySmall,
-                                  ),
-                                ),
-                            ],
-                          ),
+                        const SizedBox(height: 8),
+                        Text(
+                          'Side characters',
+                          style: Theme.of(context).textTheme.labelLarge,
                         ),
-                        const SizedBox(height: 12),
-                        const Divider(),
-                      ],
-                      if (Lfm3AudioModel.supported) ...[
-                        Container(
-                          padding: const EdgeInsets.fromLTRB(14, 12, 14, 10),
-                          decoration: BoxDecoration(
-                            color: Theme.of(context)
-                                .colorScheme
-                                .surfaceContainerHighest,
-                            borderRadius: BorderRadius.circular(16),
-                          ),
-                          child: Column(
-                            crossAxisAlignment: CrossAxisAlignment.start,
-                            children: [
-                              Row(
-                                children: [
-                                  const Icon(Icons.graphic_eq, size: 18),
-                                  const SizedBox(width: 8),
-                                  Expanded(
-                                    child: Text(
-                                      'Experimental · LFM3-Audio narrator',
-                                      style: Theme.of(context)
-                                          .textTheme
-                                          .titleSmall,
-                                    ),
-                                  ),
-                                ],
-                              ),
-                              const SizedBox(height: 6),
-                              Text(
-                                'Optional ${Lfm3AudioModel.displaySize} '
-                                'on-device model by Liquid AI. It reads '
-                                'narration with a 24 kHz voice while quoted '
-                                'dialogue keeps your cast. It has two voices '
-                                'and can be slow; download it only if you want '
-                                'to try it.',
-                                style: Theme.of(context).textTheme.bodySmall,
-                              ),
-                              const SizedBox(height: 2),
-                              Text(
-                                'Model license: ${Lfm3AudioModel.license}.',
-                                style: Theme.of(context).textTheme.bodySmall,
-                              ),
-                              Material(
-                                type: MaterialType.transparency,
-                                child: SwitchListTile(
-                                  contentPadding: EdgeInsets.zero,
-                                  title: const Text(
-                                    'Use LFM3-Audio for narration',
-                                  ),
-                                  subtitle: Text(
-                                    _lfm3AudioDownloading
-                                        ? 'Downloading the model…'
-                                        : _lfm3AudioReady
-                                        ? 'Model ready on this device'
-                                        : 'Model not downloaded',
-                                  ),
-                                  value: settings.lfm3Narration,
-                                  onChanged: _lfm3AudioDownloading
-                                      ? null
-                                      : (value) => unawaited(
-                                          _toggleLfm3Audio(
-                                            value,
-                                            onUpdate: refreshSheet,
-                                          ),
-                                        ),
-                                ),
-                              ),
-                              if (_lfm3AudioDownloading) ...[
-                                const SizedBox(height: 4),
-                                LinearProgressIndicator(
-                                  value: _lfm3AudioTotal > 0
-                                      ? (_lfm3AudioReceived / _lfm3AudioTotal)
-                                            .clamp(0.0, 1.0)
-                                      : null,
-                                ),
-                                const SizedBox(height: 6),
-                                Text(
-                                  '${(_lfm3AudioReceived / _lfm3AudioTotal * 100).clamp(0, 100).round()}% of '
-                                  '${Lfm3AudioModel.displaySize}',
-                                  style: Theme.of(context).textTheme.bodySmall,
-                                ),
-                              ],
-                              if (_lfm3AudioReady) ...[
-                                const SizedBox(height: 8),
-                                Row(
-                                  children: [
-                                    Expanded(
-                                      child: DropdownButtonFormField<String>(
-                                        key: ValueKey(
-                                          'lfm3-audio-voice-'
-                                          '${settings.lfm3Voice}',
-                                        ),
-                                        decoration: const InputDecoration(
-                                          labelText: 'LFM3-Audio voice',
-                                          border: OutlineInputBorder(),
-                                          isDense: true,
-                                        ),
-                                        initialValue: settings.lfm3Voice,
-                                        items: const [
-                                          DropdownMenuItem(
-                                            value: 'female',
-                                            child: Text('Female'),
-                                          ),
-                                          DropdownMenuItem(
-                                            value: 'male',
-                                            child: Text('Male'),
-                                          ),
-                                        ],
-                                        onChanged: (value) => update(() {
-                                          _narrator.settings = settings
-                                              .withChanges(lfm3Voice: value);
-                                          unawaited(_savePreferences());
-                                        }),
-                                      ),
-                                    ),
-                                    const SizedBox(width: 8),
-                                    IconButton(
-                                      tooltip: 'Delete LFM3-Audio model',
-                                      onPressed: _lfm3AudioDownloading
-                                          ? null
-                                          : () => unawaited(
-                                              _deleteLfm3Audio(
-                                                onUpdate: refreshSheet,
-                                              ),
-                                            ),
-                                      icon: const Icon(
-                                        Icons.delete_outline,
-                                        size: 20,
-                                      ),
-                                    ),
-                                  ],
-                                ),
-                                if (settings.lfm3Narration)
-                                  Text(
-                                    'Character dialogue still uses the cast '
-                                    'voices. Turn off Character voices to have '
-                                    'LFM3-Audio read the whole book.',
-                                    style: Theme.of(context)
-                                        .textTheme
-                                        .bodySmall,
-                                  ),
-                              ] else if (!_lfm3AudioDownloading)
-                                Padding(
-                                  padding: const EdgeInsets.only(top: 4),
-                                  child: Text(
-                                    'Turning this on starts the model '
-                                    'download.',
-                                    style: Theme.of(context)
-                                        .textTheme
-                                        .bodySmall,
-                                  ),
-                                ),
-                            ],
-                          ),
+                      ] else
+                        _VoiceNotice(
+                          message:
+                              'No main character is pinned yet. Choose one '
+                              'so their voice can never be taken by the '
+                              'automatic cast.',
+                          action: 'Choose',
+                          onAction: () => unawaited(_pickLead()),
                         ),
-                        const SizedBox(height: 12),
-                        const Divider(),
-                      ],
-                      _SettingSlider(
-                        label: 'Speed',
-                        display: '${settings.speed.toStringAsFixed(2)}×',
-                        value: settings.speed,
-                        min: .6,
-                        max: 1.8,
-                        onChanged: (value) => update(
-                          () => _narrator.settings = settings.withChanges(
-                            speed: value,
+                      for (final entry in _cast.voices.entries)
+                        if (entry.key != _cast.lead)
+                          _CastVoiceTile(
+                            character: entry.key,
+                            voice: entry.value,
+                            settings: settings,
+                            systemVoices: _systemVoices,
+                            leadVoice: _cast.voiceFor(_cast.lead ?? ''),
+                            onChanged: (voice) => update(() {
+                              _cast = _cast.withVoice(entry.key, voice);
+                              unawaited(_saveCast());
+                            }),
+                            onRemove: () => update(() {
+                              _cast = _cast.withoutVoice(entry.key);
+                              unawaited(_saveCast());
+                            }),
+                            onMakeLead: () => unawaited(_setLead(entry.key)),
+                            onMergeIntoLead: _cast.lead == null
+                                ? null
+                                : () => unawaited(_mergeIntoLead(entry.key)),
                           ),
-                        ),
+                      const SizedBox(height: 4),
+                      const Text(
+                        'The main character always keeps their reserved '
+                        'voice. Side characters get a different voice. '
+                        'Detection is approximate, so review anything that '
+                        'sounds wrong.',
                       ),
-                      if (system)
-                        _SettingSlider(
-                          label: 'Tone',
-                          display: '${((settings.pitch - 1) * 100).round()}%',
-                          value: settings.pitch,
-                          min: .75,
-                          max: 1.35,
-                          onChanged: (value) => update(
-                            () => _narrator.settings = settings.withChanges(
-                              pitch: value,
-                            ),
+                    ],
+                    const SizedBox(height: 4),
+                    Align(
+                      alignment: Alignment.centerLeft,
+                      child: TextButton.icon(
+                        onPressed: () => unawaited(_reviewSpeakers()),
+                        icon: const Icon(Icons.record_voice_over_outlined),
+                        label: const Text('Review speakers in this chapter'),
+                      ),
+                    ),
+                    const SizedBox(height: 12),
+                    const Divider(),
+
+                    if (Lfm3Model.supported) ...[
+                      Text(
+                        'Speaker analysis',
+                        style: Theme.of(context).textTheme.titleMedium,
+                      ),
+                      if (_lfm3Enabled && _lfm3Ready)
+                        FilledButton.tonalIcon(
+                          onPressed: _lfm3Analyzing
+                              ? null
+                              : () async {
+                                  final analysis = _analyzeWithLfm3();
+                                  refreshSheet();
+                                  await analysis;
+                                  refreshSheet();
+                                },
+                          icon: const Icon(Icons.auto_awesome_outlined),
+                          label: Text(
+                            _lfm3Analyzing
+                                ? 'Analyzing…'
+                                : 'Analyze this chapter',
                           ),
                         )
                       else
-                        _SettingSlider(
-                          label: 'Sentence pauses',
-                          display: '${(settings.pauses * 100).round()}%',
-                          value: settings.pauses,
-                          min: .05,
-                          max: 1,
-                          onChanged: (value) => update(
-                            () => _narrator.settings = settings.withChanges(
-                              pauses: value,
-                            ),
-                          ),
-                        ),
-                      _SettingSlider(
-                        label: 'Volume',
-                        display: '${(settings.volume * 100).round()}%',
-                        value: settings.volume,
-                        min: 0,
-                        max: 1,
-                        onChanged: (value) => update(() {
-                          _narrator.settings = settings.withChanges(
-                            volume: value,
-                          );
-                          unawaited(_narrator.setVolume(value));
-                        }),
-                      ),
-                      SwitchListTile(
-                        contentPadding: EdgeInsets.zero,
-                        title: const Text('Battery saver'),
-                        subtitle: const Text(
-                          'Uses fewer CPU threads and generates less audio '
-                          'ahead. Recommended for long listening sessions on '
-                          'iPhone.',
-                        ),
-                        value: settings.batterySaver,
-                        onChanged: (value) => update(() {
-                          _narrator.settings = settings.withChanges(
-                            batterySaver: value,
-                          );
-                          unawaited(_savePreferences());
-                        }),
-                      ),
-                      SwitchListTile(
-                        contentPadding: EdgeInsets.zero,
-                        title: const Text('Background playback'),
-                        subtitle: const Text(
-                          'Keep reading when you switch apps or lock your screen.',
-                        ),
-                        value: _backgroundPlayback,
-                        onChanged: (value) =>
-                            update(() => _backgroundPlayback = value),
-                      ),
-                      SwitchListTile(
-                        contentPadding: EdgeInsets.zero,
-                        title: const Text('Continue through the book'),
-                        subtitle: const Text(
-                          'Automatically start the next chapter or page, even '
-                          'while the screen is locked.',
-                        ),
-                        value: _continueToEnd,
-                        onChanged: (value) =>
-                            update(() => _continueToEnd = value),
-                      ),
-                      SwitchListTile(
-                        contentPadding: EdgeInsets.zero,
-                        title: const Text('Speak punctuation marks'),
-                        subtitle: const Text(
-                          'Say “comma”, “period”, and other marks out loud.',
-                        ),
-                        value: settings.punctuation == Punctuation.announce,
-                        onChanged: (value) => update(() {
-                          _narrator.settings = settings.withChanges(
-                            punctuation: value
-                                ? Punctuation.announce
-                                : Punctuation.natural,
-                          );
-                        }),
-                      ),
-                    ] else ...[
-                      ThemeChooser(
-                        controller: widget.theme,
-                        onChanged: () => update(() {}),
-                      ),
-                      const SizedBox(height: 8),
-                      Text(
-                        widget.theme.choice.description,
-                        style: Theme.of(context).textTheme.bodySmall,
-                      ),
-                      const SizedBox(height: 20),
-                      if (_isPdf) ...[
                         const Text(
-                          'Pages turn sideways, one full page at a time. '
-                          'Pinch or double-tap to zoom; double-tap again to '
-                          'fit the whole page.',
+                          'Enable LFM3 suggestions in Settings to analyze this book.',
                         ),
-                        SwitchListTile(
-                          contentPadding: EdgeInsets.zero,
-                          title: const Text('Darken PDF pages'),
-                          subtitle: const Text(
-                            'Invert page colors in dark themes.',
-                          ),
-                          value: _darkPdfPages,
-                          onChanged: (value) =>
-                              update(() => _darkPdfPages = value),
-                        ),
-                      ] else ...[
-                        _SettingSlider(
-                          label: 'Text size',
-                          display: '${_fontSize.round()}',
-                          value: _fontSize,
-                          min: 15,
-                          max: 34,
-                          onChanged: (value) => update(() => _fontSize = value),
-                        ),
-                        _SettingSlider(
-                          label: 'Line spacing',
-                          display: _lineHeight.toStringAsFixed(2),
-                          value: _lineHeight,
-                          min: 1.25,
-                          max: 2,
-                          onChanged: (value) =>
-                              update(() => _lineHeight = value),
-                        ),
-                      ],
                     ],
+                    if (_lfm3Analyzing) ...[
+                      const LinearProgressIndicator(),
+                      Text(
+                        _lfm3Total > 0
+                            ? 'Part ${_lfm3Received + 1} of $_lfm3Total'
+                            : 'Loading the model…',
+                      ),
+                    ],
+                    TextButton.icon(
+                      onPressed: () {
+                        Navigator.pop(context);
+                        unawaited(_openSettings());
+                      },
+                      icon: const Icon(Icons.settings_outlined),
+                      label: const Text('App settings'),
+                    ),
                   ],
                 ),
               ),
@@ -2212,21 +1129,6 @@ class _ReaderState extends State<Reader> {
         },
       ),
     );
-    await _narrator.stopPreview();
-    if (mounted) await _savePreferences();
-  }
-
-  Future<void> _previewVoice(VoiceSettings settings) async {
-    setState(() => _previewing = true);
-    try {
-      await _narrator.preview(settings);
-    } on SpeechFailure catch (error) {
-      if (mounted) _notice(error.message);
-    } catch (_) {
-      if (mounted) _notice('The voice preview could not be played.');
-    } finally {
-      if (mounted) setState(() => _previewing = false);
-    }
   }
 
   Widget _sheet(Widget child) => Theme(
@@ -2242,29 +1144,44 @@ class _ReaderState extends State<Reader> {
   void _play() {
     switch (_narrator.state) {
       case SpeechState.idle:
-        final settings = _narrator.settings;
-        final choices = _voiceChoices(settings);
-        var runCast = _cast;
+        if (!_notifiedDefaultFallback &&
+            _preferences.voice.engine == VoiceEngine.supertonic &&
+            _narrator.settings.engine != VoiceEngine.supertonic) {
+          _notifiedDefaultFallback = true;
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(
+              content: const Text(
+                'Download Supertonic 3 in Settings to use the default narrator. Kokoro is ready offline for now.',
+              ),
+              action: SnackBarAction(
+                label: 'Settings',
+                onPressed: () => unawaited(_openSettings()),
+              ),
+            ),
+          );
+        }
         final resumeHere = _resume != null && _resume!.section == _index;
         _narrator.start(
           title: book.entry.title,
+          bookId: book.entry.id,
           sectionName: _unit,
           index: _index,
           length: _length,
           loadSpeech: (section) async {
+            final settings = _narrator.settings;
+            final choices = _voiceChoices(settings);
             final text = await book.spokenText(section);
             final cached = await _cachedAttribution(section, text);
             final script = buildSpeechScript(
               text: text,
               settings: settings,
-              cast: runCast,
+              cast: _cast,
               choices: choices,
               attribution: cached,
             );
             if (script.castChanged) {
-              runCast = script.cast;
               _cast = script.cast;
-              unawaited(_saveCast());
+              unawaited(_saveCast(apply: false));
             }
             unawaited(_saveSectionAttribution(section, text, script));
             return script.utterances;
@@ -2290,6 +1207,8 @@ class _ReaderState extends State<Reader> {
     _textScroll.dispose();
     _pdfController?.dispose();
     widget.theme.removeListener(_themeChanged);
+    _preferences.removeListener(_preferencesChanged);
+    if (widget.preferences == null) _preferences.dispose();
     _narrator.removeListener(_narratorChanged);
     _lifecycle.dispose();
     unawaited(_savePosition());
@@ -2535,9 +1454,9 @@ class _ReaderState extends State<Reader> {
         ),
         actions: [
           TextButton.icon(
-            onPressed: () => _settings(voice: false),
-            icon: const Icon(Icons.palette_outlined, size: 19),
-            label: const Text('Theme'),
+            onPressed: _openSettings,
+            icon: const Icon(Icons.settings_outlined, size: 19),
+            label: const Text('Settings'),
           ),
           IconButton(
             tooltip: _bookmark == _index
@@ -2639,6 +1558,87 @@ class _ReaderState extends State<Reader> {
                 ),
               if (_narrator.state == SpeechState.preparing)
                 const LinearProgressIndicator(minHeight: 2),
+              if (_narrator.active || _narrator.navigating)
+                ListenableBuilder(
+                  listenable: _narrator.sleepTimer,
+                  builder: (context, _) {
+                    final timer = _narrator.sleepTimer;
+                    final remaining = timer.remaining;
+                    final timerLabel = timer.atSectionEnd
+                        ? 'End of ${_unit.toLowerCase()}'
+                        : remaining == null
+                        ? 'Sleep timer'
+                        : '${remaining.inMinutes}:${(remaining.inSeconds % 60).toString().padLeft(2, '0')}';
+                    return Row(
+                      mainAxisAlignment: MainAxisAlignment.center,
+                      children: [
+                        IconButton(
+                          tooltip: 'Previous sentence',
+                          onPressed: _narrator.canPreviousSentence
+                              ? () => unawaited(_narrator.previousSentence())
+                              : null,
+                          icon: const Icon(Icons.skip_previous),
+                        ),
+                        Flexible(
+                          child: Text(
+                            _narrator.currentUtterance == null
+                                ? 'Preparing…'
+                                : 'Sentence ${_narrator.currentUtterance! + 1}',
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                          ),
+                        ),
+                        IconButton(
+                          tooltip: 'Next sentence',
+                          onPressed: _narrator.canNextSentence
+                              ? () => unawaited(_narrator.nextSentence())
+                              : null,
+                          icon: const Icon(Icons.skip_next),
+                        ),
+                        PopupMenuButton<int>(
+                          tooltip: 'Sleep timer',
+                          onSelected: (minutes) {
+                            if (minutes == 0) {
+                              timer.cancel();
+                            } else if (minutes == -1) {
+                              final section = _narrator.currentSection;
+                              if (section != null) timer.setSectionEnd(section);
+                            } else {
+                              timer.setDuration(Duration(minutes: minutes));
+                            }
+                          },
+                          itemBuilder: (_) => [
+                            const PopupMenuItem(value: 0, child: Text('Off')),
+                            for (final minutes in [15, 30, 60])
+                              PopupMenuItem(
+                                value: minutes,
+                                child: Text('$minutes minutes'),
+                              ),
+                            PopupMenuItem(
+                              value: -1,
+                              enabled: _narrator.currentSection != null,
+                              child: Text(
+                                'End of current ${_unit.toLowerCase()}',
+                              ),
+                            ),
+                          ],
+                          icon: Icon(
+                            Icons.bedtime_outlined,
+                            color: timer.active ? _paper.accent : null,
+                          ),
+                        ),
+                        Flexible(
+                          child: Text(
+                            timerLabel,
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                          ),
+                        ),
+                        const SizedBox(width: 8),
+                      ],
+                    );
+                  },
+                ),
               Row(
                 mainAxisAlignment: MainAxisAlignment.center,
                 children: [
@@ -2681,15 +1681,15 @@ class _ReaderState extends State<Reader> {
                       _ => Icons.pause,
                     }),
                   ),
-                  if (_narrator.active)
+                  if (_narrator.active || _narrator.navigating)
                     IconButton(
                       tooltip: 'Stop narration',
                       onPressed: _narrator.stop,
                       icon: const Icon(Icons.stop),
                     ),
                   IconButton(
-                    tooltip: 'Read aloud settings',
-                    onPressed: () => _settings(voice: true),
+                    tooltip: 'Book settings',
+                    onPressed: _bookSettings,
                     icon: const Icon(Icons.tune),
                   ),
                 ],
@@ -2701,7 +1701,7 @@ class _ReaderState extends State<Reader> {
     ),
   );
 
-  bool get _canNavigate => !_changing;
+  bool get _canNavigate => !_changing && !_narrator.navigating;
 }
 
 class _PdfSheet extends StatefulWidget {
@@ -3037,42 +2037,5 @@ class _VoiceNotice extends StatelessWidget {
         TextButton(onPressed: onAction, child: Text(action)),
       ],
     ),
-  );
-}
-
-class _SettingSlider extends StatelessWidget {
-  const _SettingSlider({
-    required this.label,
-    required this.display,
-    required this.value,
-    required this.min,
-    required this.max,
-    required this.onChanged,
-  });
-
-  final String label;
-  final String display;
-  final double value;
-  final double min;
-  final double max;
-  final ValueChanged<double> onChanged;
-
-  @override
-  Widget build(BuildContext context) => Column(
-    crossAxisAlignment: CrossAxisAlignment.start,
-    children: [
-      Text('$label · $display'),
-      Semantics(
-        label: label,
-        child: Slider(
-          value: value,
-          min: min,
-          max: max,
-          label: display,
-          semanticFormatterCallback: (_) => display,
-          onChanged: onChanged,
-        ),
-      ),
-    ],
   );
 }

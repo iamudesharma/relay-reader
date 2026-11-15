@@ -18,6 +18,8 @@
 		97C146FE1CF9000F007C117D /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = 97C146FD1CF9000F007C117D /* Assets.xcassets */; };
 		97C147011CF9000F007C117D /* LaunchScreen.storyboard in Resources */ = {isa = PBXBuildFile; fileRef = 97C146FF1CF9000F007C117D /* LaunchScreen.storyboard */; };
 		A1B2C3D4E5F60718293A4B5C /* SystemVoices.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1B2C3D4E5F60718293A4B5D /* SystemVoices.swift */; };
+		B12300000000000000000001 /* RelaySupertonic.swift in Sources */ = {isa = PBXBuildFile; fileRef = B12300000000000000000002; };
+		B12300000000000000000003 /* SupertonicCore in Frameworks */ = {isa = PBXBuildFile; productRef = B12300000000000000000004; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -65,6 +67,7 @@
 		97C147001CF9000F007C117D /* Base */ = {isa = PBXFileReference; lastKnownFileType = file.storyboard; name = Base; path = Base.lproj/LaunchScreen.storyboard; sourceTree = "<group>"; };
 		97C147021CF9000F007C117D /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
 		A1B2C3D4E5F60718293A4B5D /* SystemVoices.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SystemVoices.swift; sourceTree = "<group>"; };
+		B12300000000000000000002 /* RelaySupertonic.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = RelaySupertonic.swift; path = ../../native/RelaySupertonic.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -73,6 +76,7 @@
 			buildActionMask = 2147483647;
 			files = (
 				78A318202AECB46A00862997 /* FlutterGeneratedPluginSwiftPackage in Frameworks */,
+				B12300000000000000000003 /* SupertonicCore in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -133,6 +137,7 @@
 				74858FAD1ED2DC5600515810 /* Runner-Bridging-Header.h */,
 				3DF05A9EFE53366BD4CF4612 /* Runner.entitlements */,
 				53036B72E96D0F72ABD3250C /* RelayPhonon.swift */,
+				B12300000000000000000002 /* RelaySupertonic.swift */,
 				43396AA676B02970704B55E6 /* PhononCore.xcframework */,
 			);
 			path = Runner;
@@ -176,6 +181,7 @@
 			name = Runner;
 			packageProductDependencies = (
 				78A3181F2AECB46A00862997 /* FlutterGeneratedPluginSwiftPackage */,
+				B12300000000000000000004 /* SupertonicCore */,
 			);
 			productName = Runner;
 			productReference = 97C146EE1CF9000F007C117D /* Runner.app */;
@@ -212,6 +218,7 @@
 			mainGroup = 97C146E51CF9000F007C117D;
 			packageReferences = (
 				781AD8BC2B33823900A9FFBB /* XCLocalSwiftPackageReference "FlutterGeneratedPluginSwiftPackage" */,
+				B12300000000000000000005 /* SupertonicCore */,
 			);
 			productRefGroup = 97C146EF1CF9000F007C117D /* Products */;
 			projectDirPath = "";
@@ -296,6 +303,7 @@
 				7884E8682EC3CC0700C636F2 /* SceneDelegate.swift in Sources */,
 				A1B2C3D4E5F60718293A4B5C /* SystemVoices.swift in Sources */,
 				513CFC1822109DB07C92FF4C /* RelayPhonon.swift in Sources */,
+				B12300000000000000000001 /* RelaySupertonic.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -715,6 +723,7 @@
 			isa = XCLocalSwiftPackageReference;
 			relativePath = Flutter/ephemeral/Packages/FlutterGeneratedPluginSwiftPackage;
 		};
+		B12300000000000000000005 /* SupertonicCore */ = {isa = XCLocalSwiftPackageReference; relativePath = ../native/SupertonicCore; };
 /* End XCLocalSwiftPackageReference section */
 
 /* Begin XCSwiftPackageProductDependency section */
@@ -722,6 +731,7 @@
 			isa = XCSwiftPackageProductDependency;
 			productName = FlutterGeneratedPluginSwiftPackage;
 		};
+		B12300000000000000000004 /* SupertonicCore */ = {isa = XCSwiftPackageProductDependency; package = B12300000000000000000005; productName = SupertonicCore; };
 /* End XCSwiftPackageProductDependency section */
 	};
 	rootObject = 97C146E61CF9000F007C117D /* Project object */;

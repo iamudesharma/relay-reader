@@ -260,19 +260,19 @@ void main() {
       () => find.byTooltip('Read aloud').evaluate().isNotEmpty,
     );
     await tester.tap(find.byTooltip('Read aloud'));
-    bool highlighted() => tester.widgetList<SelectableText>(
-      find.byType(SelectableText),
-    ).any((widget) {
-      bool hasHighlight(InlineSpan span) {
-        if (span is TextSpan) {
-          if (span.style?.backgroundColor != null) return true;
-          return span.children?.any(hasHighlight) ?? false;
-        }
-        return false;
-      }
+    bool highlighted() => tester
+        .widgetList<SelectableText>(find.byType(SelectableText))
+        .any((widget) {
+          bool hasHighlight(InlineSpan span) {
+            if (span is TextSpan) {
+              if (span.style?.backgroundColor != null) return true;
+              return span.children?.any(hasHighlight) ?? false;
+            }
+            return false;
+          }
 
-      return widget.textSpan != null && hasHighlight(widget.textSpan!);
-    });
+          return widget.textSpan != null && hasHighlight(widget.textSpan!);
+        });
     final end = DateTime.now().add(const Duration(seconds: 150));
     while (!highlighted() && DateTime.now().isBefore(end)) {
       await tester.pump(const Duration(milliseconds: 250));
@@ -317,11 +317,10 @@ void main() {
         ),
       ),
     );
-    await _until(
-      tester,
-      () => find.byTooltip('Read aloud settings').evaluate().isNotEmpty,
-    );
-    await tester.tap(find.byTooltip('Read aloud settings'));
+    await _until(tester, () => find.text('Settings').evaluate().isNotEmpty);
+    await tester.tap(find.text('Settings'));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('Models'));
     await tester.pumpAndSettle();
     expect(find.text('Experimental · LFM3-Audio narrator'), findsOneWidget);
     final toggle = find.widgetWithText(

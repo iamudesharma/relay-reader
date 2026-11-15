@@ -9,6 +9,7 @@ import 'package:pdfrx/pdfrx.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 import 'character_voices.dart';
+import 'audio_clip_cache.dart';
 import 'epub_recovery.dart';
 
 const _drmMessage =
@@ -324,6 +325,7 @@ class Library {
     await _prefs.remove('narration.${book.id}');
     await _prefs.remove('cast.${book.id}');
     await _prefs.remove('attribution.${book.id}');
+    await AudioClipCache.shared.removeBook(book.id);
     if (await _prefs.getString('reader.lastNarration') == book.id) {
       await _prefs.remove('reader.lastNarration');
     }

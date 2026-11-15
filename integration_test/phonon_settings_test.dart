@@ -62,7 +62,7 @@ void main() {
       ),
     );
     await tester.pumpAndSettle();
-    await tester.tap(find.byTooltip('Read aloud settings'));
+    await tester.tap(find.text('Settings'));
     await tester.pumpAndSettle();
     expect(find.text('Phonon'), findsOneWidget);
     await tester.tap(find.text('Phonon'));
