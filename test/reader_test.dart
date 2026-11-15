@@ -555,7 +555,9 @@ void main() {
       expect(find.text('Page 2 / 2'), findsOneWidget);
       tester.view.physicalSize = const Size(667, 375);
       await tester.pumpAndSettle();
-      await tester.tap(find.text('Theme'));
+      await tester.tap(find.text('Settings'));
+      await tester.pumpAndSettle();
+      await tester.tap(find.text('Appearance'));
       await tester.pumpAndSettle();
       await tester.tap(find.text('Night'));
       await tester.pumpAndSettle();
@@ -565,12 +567,20 @@ void main() {
             .selected,
         isTrue,
       );
+      await tester.pageBack();
+      await tester.pumpAndSettle();
+      await tester.tap(find.byTooltip('Book settings'));
+      await tester.pumpAndSettle();
+      expect(find.text('Cast'), findsOneWidget);
+      expect(find.text('Battery saver'), findsNothing);
       await tester.tapAt(const Offset(10, 10));
       await tester.pumpAndSettle();
-      await tester.tap(find.byTooltip('Read aloud settings'));
+      await tester.tap(find.text('Settings'));
       await tester.pumpAndSettle();
       expect(find.text('Continue through the book'), findsOneWidget);
       expect(find.text('Battery saver'), findsOneWidget);
+      await tester.tap(find.text('Models'));
+      await tester.pumpAndSettle();
       expect(find.text('Experimental · LFM3-Audio narrator'), findsOneWidget);
       expect(find.text('Use LFM3-Audio for narration'), findsOneWidget);
       expect(tester.takeException(), isNull);

@@ -2,6 +2,9 @@ import 'dart:convert';
 import 'dart:io';
 
 import 'package:flutter_edge_ai/flutter_edge_ai.dart';
+import 'package:flutter_edge_ai_llama/flutter_edge_ai_llama.dart';
+
+import 'deferred_initialization.dart';
 
 /// A paragraph-level speaker suggestion from the experimental LFM3 model.
 class Lfm3Suggestion {
@@ -34,17 +37,21 @@ abstract final class Lfm3Model {
   );
 
   static InferenceModel? _model;
-  static bool _packageReady = false;
+  static final _initialization = DeferredInitialization(
+    () => FlutterEdgeAi.initialize(
+      inferenceEngines: const [LlamaEngineProvider()],
+    ),
+  );
 
-  static bool get supported =>
-      _packageReady && (Platform.isIOS || Platform.isMacOS);
+  static bool get supported => Platform.isIOS || Platform.isMacOS;
 
   /// Called once after Flutter Edge AI registers its llama.cpp engine.
-  static void markReady() => _packageReady = true;
+  static void markReady() => _initialization.markReady();
 
   static Future<bool> isDownloaded() async {
     if (!supported) return false;
     try {
+      await _initialization.ensureReady();
       return await FlutterEdgeAi.isModelInstalled(fileName);
     } catch (_) {
       return false;
@@ -60,6 +67,7 @@ abstract final class Lfm3Model {
       throw const Lfm3Exception('LFM3 is not available on this platform.');
     }
     try {
+      await _initialization.ensureReady();
       await FlutterEdgeAi.installModel(
             modelType: ModelType.general,
             fileType: ModelFileType.gguf,
@@ -147,6 +155,7 @@ abstract final class Lfm3Model {
   static Future<void> delete() async {
     await unload();
     try {
+      await _initialization.ensureReady();
       await FlutterEdgeAi.uninstallModel(fileName);
     } catch (error) {
       throw Lfm3Exception('The LFM3 model could not be deleted: $error');

@@ -12,6 +12,9 @@ class MainFlutterWindow: NSWindow {
     RelayPhonon.shared.register(
       messenger: flutterViewController.engine.binaryMessenger
     )
+    RelaySupertonic.shared.register(
+      messenger: flutterViewController.engine.binaryMessenger
+    )
 
     super.awakeFromNib()
   }

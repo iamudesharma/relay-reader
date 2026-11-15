@@ -60,3 +60,7 @@ app.*.map.json
 /native/PhononCore.xcframework/
 /native/core.zip
 /native/core.zip.part
+
+# MediaPipe model bundles prepared with the package bundler.
+/assets/mediapipe/*
+!/assets/mediapipe/README.txt

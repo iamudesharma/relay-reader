@@ -3,27 +3,18 @@ import 'dart:async';
 import 'package:file_selector/file_selector.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
-import 'package:flutter_edge_ai/flutter_edge_ai.dart';
-import 'package:flutter_edge_ai_llama/flutter_edge_ai_llama.dart';
 
-import 'lfm3.dart';
 import 'library.dart';
 import 'narration.dart';
 import 'reader.dart';
 import 'reading_page.dart';
 import 'theme.dart';
+import 'reader_preferences.dart';
+import 'settings_screen.dart';
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
   await initializeNarration();
-  try {
-    await FlutterEdgeAi.initialize(
-      inferenceEngines: const [LlamaEngineProvider()],
-    );
-    Lfm3Model.markReady();
-  } catch (error) {
-    debugPrint('On-device LFM3 is unavailable: $error');
-  }
   final theme = await ReaderThemeController.load();
   runApp(RelayReader(theme: theme));
 }
@@ -57,6 +48,7 @@ class Bookshelf extends StatefulWidget {
 
 class _BookshelfState extends State<Bookshelf> {
   final _library = Library();
+  final _preferences = ReaderPreferences();
   List<LibraryBook> _books = [];
   ({LibraryBook book, NarrationCheckpoint checkpoint})? _continueListening;
   bool _busy = true;
@@ -106,6 +98,7 @@ class _BookshelfState extends State<Bookshelf> {
           book: book,
           library: _library,
           theme: widget.theme,
+          preferences: _preferences,
           position: position,
           bookmark: bookmark,
           resumeNarration: resumeNarration,
@@ -209,6 +202,7 @@ class _BookshelfState extends State<Bookshelf> {
 
   @override
   void dispose() {
+    _preferences.dispose();
     unawaited(_library.close());
     super.dispose();
   }
@@ -222,9 +216,16 @@ class _BookshelfState extends State<Bookshelf> {
         title: const Text('Relay Reader'),
         actions: [
           IconButton(
-            tooltip: 'Reading theme',
-            onPressed: () => showReadingThemeSheet(context, widget.theme),
-            icon: const Icon(Icons.palette_outlined),
+            tooltip: 'Settings',
+            onPressed: () => Navigator.of(context).push(
+              MaterialPageRoute<void>(
+                builder: (_) => SettingsScreen(
+                  preferences: _preferences,
+                  theme: widget.theme,
+                ),
+              ),
+            ),
+            icon: const Icon(Icons.settings_outlined),
           ),
           Padding(
             padding: const EdgeInsets.only(right: 12),
